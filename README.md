@@ -8,7 +8,7 @@ SheetBro opens and saves Excel (`.xlsx`) and CSV files, calculates formulas with
 and edit the workbook you have open. You can see every change they make as it happens, and
 undo it with <kbd>⌘Z</kbd>.
 
-![SheetBro showing a sales report with formulas and number formatting](docs/screenshot.png)
+![SheetBro with a Q3 sales report open, next to a Claude Code session that adds a revenue-by-region summary to the sheet through SheetBro's MCP tools](docs/screenshot.png)
 
 ## Features
 
@@ -31,6 +31,8 @@ undo it with <kbd>⌘Z</kbd>.
 2. Pick your client. SheetBro shows a ready-made config snippet for Claude Code, Claude Desktop,
    Cursor, VS Code, Windsurf, Gemini CLI and Codex CLI.
 3. Copy the snippet into your client's MCP settings.
+
+![The AI tools panel with the MCP server turned on and the Claude Code setup command shown](docs/mcp-panel.png)
 
 There are two ways to connect:
 
