@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SheetBro",
+  "version": "0.1.0",
+  "identifier": "com.jetorbit.spritsit",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SheetBro",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 18, "y": 26 },
+        "dragDropEnabled": true
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns"],
+    "category": "Productivity",
+    "macOS": { "minimumSystemVersion": "11.0" },
+    "fileAssociations": [
+      {
+        "ext": ["xlsx"],
+        "name": "Excel Workbook",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "role": "Editor"
+      },
+      {
+        "ext": ["csv"],
+        "name": "CSV Document",
+        "mimeType": "text/csv",
+        "role": "Editor"
+      }
+    ]
+  }
+}
