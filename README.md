@@ -296,6 +296,14 @@ as the tag, the title as the release name, and paste the bullet list as the rele
 Keep one change per line and start it with `feat:`, `fix:`, `perf:` or `docs:`, so the website
 can label it New, Fix, Perf or Docs.
 
+### v0.2.0 — Right-click menu and moving cells
+
+_October 29, 2026_
+
+- feat: Right-click menu on cells and on row and column headers, with cut, copy, paste, paste special (values only or formatting only), clear contents, and merge or unmerge
+- feat: Insert and delete rows, columns and cells from the menu; formulas follow the cells that move, and ranges grow or shrink to match
+- feat: Drag the edge of a selection to move its cells, with their formatting
+
 ### v0.1.0 — First public release
 
 _October 29, 2026_
