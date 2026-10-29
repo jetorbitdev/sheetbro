@@ -1,9 +1,9 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window permissions",
+  "description": "Permissions of every workbook window",
   "windows": [
-    "main"
+    "*"
   ],
   "permissions": [
     "core:default",

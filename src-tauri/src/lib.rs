@@ -1,12 +1,14 @@
 mod mcp;
 
 use std::{
+    collections::HashMap,
     fs,
     io::BufWriter,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Mutex, MutexGuard,
     },
 };
 
@@ -23,8 +25,9 @@ use ironcalc::{
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItemBuilder, SubmenuBuilder},
-    AppHandle, Emitter, Runtime, State,
+    AppHandle, Emitter, Manager, Runtime, State, WebviewWindowBuilder, Window, WindowEvent,
 };
+use tauri_plugin_dialog::DialogExt;
 
 const LOCALE: &str = "en";
 const TZ: &str = "UTC";
@@ -41,6 +44,8 @@ struct Doc {
     redo_groups: Vec<usize>,
     /// Changes whenever the content may have changed, so caches built from it know to refresh
     generation: u64,
+    /// The empty workbook a window starts with, not a file that was opened
+    blank: bool,
 }
 
 static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -58,7 +63,17 @@ impl Doc {
             undo_groups: Vec::new(),
             redo_groups: Vec::new(),
             generation: next_generation(),
+            blank: false,
         }
+    }
+
+    fn empty() -> CmdResult<Self> {
+        Ok(Doc { blank: true, ..Doc::new(new_model("Untitled")?, None) })
+    }
+
+    /// Still the untouched empty workbook, so a file can be opened in its place.
+    fn is_blank(&self) -> bool {
+        self.blank && !self.dirty && self.path.is_none()
     }
 
     /// Marks the last `entries` history entries as one undoable action.
@@ -94,18 +109,60 @@ impl Doc {
 }
 
 struct AppState {
-    doc: Mutex<Doc>,
-    /// Files handed over by Finder before the webview was ready to listen
-    pending_open: Mutex<Vec<String>>,
+    /// One workbook per window, keyed by window label
+    docs: Mutex<HashMap<String, Doc>>,
+    /// Label of the window that last had focus: menu commands and AI tools act on it
+    active: Mutex<String>,
+    /// Files waiting for a window to pick them up once its webview listens. A label
+    /// stays here after its files were taken, so that window is not handed another one.
+    pending_open: Mutex<HashMap<String, Vec<String>>>,
     /// Server that lets AI tools edit the open workbook
     mcp: Mutex<mcp::Runtime>,
     /// Scratch copy of the workbook for previewing a formula before it is entered
     preview: Mutex<Option<(u64, Model<'static>)>>,
 }
 
+/// The workbook of one window, held under the lock of all of them.
+struct DocGuard<'a> {
+    docs: MutexGuard<'a, HashMap<String, Doc>>,
+    label: String,
+}
+
+impl Deref for DocGuard<'_> {
+    type Target = Doc;
+    fn deref(&self) -> &Doc {
+        &self.docs[&self.label]
+    }
+}
+
+impl DerefMut for DocGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Doc {
+        self.docs.get_mut(&self.label).unwrap()
+    }
+}
+
 impl AppState {
-    fn doc(&self) -> std::sync::MutexGuard<'_, Doc> {
-        self.doc.lock().unwrap()
+    /// The workbook of window `label`; a window starts with an empty one.
+    fn doc(&self, label: &str) -> DocGuard<'_> {
+        let mut docs = self.docs.lock().unwrap();
+        if !docs.contains_key(label) {
+            docs.insert(label.to_string(), Doc::empty().expect("create empty workbook"));
+        }
+        DocGuard { docs, label: label.to_string() }
+    }
+
+    fn active_label(&self) -> String {
+        self.active.lock().unwrap().clone()
+    }
+
+    fn active_doc(&self) -> DocGuard<'_> {
+        self.doc(&self.active_label())
+    }
+
+    /// A window with nothing in it yet and no file on its way.
+    fn is_untouched(&self, label: &str) -> bool {
+        !self.pending_open.lock().unwrap().contains_key(label)
+            && self.docs.lock().unwrap().get(label).map_or(true, Doc::is_blank)
     }
 }
 
@@ -227,6 +284,8 @@ struct WorkbookInfo {
     sheets: Vec<SheetInfo>,
     can_undo: bool,
     can_redo: bool,
+    /// untouched empty workbook: opening a file replaces it instead of using a new window
+    blank: bool,
 }
 
 #[derive(Serialize)]
@@ -292,6 +351,7 @@ fn info(doc: &Doc) -> WorkbookInfo {
         sheets,
         can_undo: !doc.undo_groups.is_empty(),
         can_redo: !doc.redo_groups.is_empty(),
+        blank: doc.is_blank(),
     }
 }
 
@@ -325,28 +385,21 @@ fn load_doc(path: &str) -> CmdResult<Doc> {
 }
 
 #[tauri::command]
-fn open_file(path: String, state: State<AppState>) -> CmdResult<WorkbookInfo> {
+fn open_file(path: String, window: Window, state: State<AppState>) -> CmdResult<WorkbookInfo> {
     let loaded = load_doc(&path)?;
-    let mut doc = state.doc();
+    let mut doc = state.doc(window.label());
     *doc = loaded;
     Ok(info(&doc))
 }
 
 #[tauri::command]
-fn new_file(state: State<AppState>) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
-    *doc = Doc::new(new_model("Untitled")?, None);
-    Ok(info(&doc))
+fn workbook_info(window: Window, state: State<AppState>) -> WorkbookInfo {
+    info(&state.doc(window.label()))
 }
 
 #[tauri::command]
-fn workbook_info(state: State<AppState>) -> WorkbookInfo {
-    info(&state.doc())
-}
-
-#[tauri::command]
-fn get_layout(sheet: u32, state: State<AppState>) -> CmdResult<Layout> {
-    let doc = state.doc();
+fn get_layout(sheet: u32, window: Window, state: State<AppState>) -> CmdResult<Layout> {
+    let doc = state.doc(window.label());
     let dim = doc.model.get_model().workbook.worksheet(sheet)?.dimension();
     let cols = (dim.max_column + 10).max(26);
     let col_widths = (1..=cols)
@@ -385,9 +438,10 @@ fn get_viewport(
     row_end: i32,
     col_start: i32,
     col_end: i32,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<Vec<Cell>> {
-    let doc = state.doc();
+    let doc = state.doc(window.label());
     let m = &doc.model;
     let mut cells = Vec::new();
     for r in row_start.max(1)..=row_end {
@@ -434,8 +488,14 @@ fn cell_kind(t: CellType) -> &'static str {
 }
 
 #[tauri::command]
-fn get_cell_content(sheet: u32, row: i32, col: i32, state: State<AppState>) -> CmdResult<String> {
-    state.doc().model.get_cell_content(sheet, row, col)
+fn get_cell_content(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<String> {
+    state.doc(window.label()).model.get_cell_content(sheet, row, col)
 }
 
 /// Writes `values` with their top-left corner at (row, col) as one undo step.
@@ -473,9 +533,10 @@ fn set_cells(
     row: i32,
     col: i32,
     values: Vec<Vec<String>>,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+    let mut doc = state.doc(window.label());
     write_cells(&mut doc, sheet, row, col, &values)?;
     Ok(info(&doc))
 }
@@ -487,9 +548,10 @@ fn clear_range(
     col: i32,
     height: i32,
     width: i32,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+    let mut doc = state.doc(window.label());
     let area = Area { sheet, row, column: col, width, height };
     doc.model.range_clear_contents(&area)?;
     doc.record(1);
@@ -505,9 +567,10 @@ fn style_range(
     width: i32,
     path: String,
     value: String,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+    let mut doc = state.doc(window.label());
     let area = Area { sheet, row, column: col, width, height };
     doc.model.update_range_style(&area, &path, &value)?;
     doc.record(1);
@@ -617,9 +680,10 @@ fn merge_cells(
     width: i32,
     mode: MergeMode,
     discard: bool,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+    let mut doc = state.doc(window.label());
     merge_in(&mut doc, &Area { sheet, row, column: col, width, height }, mode, discard)?;
     Ok(info(&doc))
 }
@@ -631,9 +695,10 @@ fn unmerge_cells(
     col: i32,
     height: i32,
     width: i32,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+    let mut doc = state.doc(window.label());
     unmerge_in(&mut doc, &Area { sheet, row, column: col, width, height })?;
     Ok(info(&doc))
 }
@@ -643,9 +708,10 @@ fn unmerge_cells(
 fn set_column_widths(
     sheet: u32,
     widths: Vec<(i32, f64)>,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+    let mut doc = state.doc(window.label());
     let mut written = 0;
     let mut result = Ok(());
     for (col, width) in widths {
@@ -669,8 +735,13 @@ struct ColumnText {
 
 /// Displayed texts of one column, used by the frontend to measure an autofit width.
 #[tauri::command]
-fn column_texts(sheet: u32, col: i32, state: State<AppState>) -> CmdResult<Vec<ColumnText>> {
-    let doc = state.doc();
+fn column_texts(
+    sheet: u32,
+    col: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<Vec<ColumnText>> {
+    let doc = state.doc(window.label());
     let m = &doc.model;
     let dim = m.get_model().workbook.worksheet(sheet)?.dimension();
     let mut out = Vec::new();
@@ -689,22 +760,22 @@ fn column_texts(sheet: u32, col: i32, state: State<AppState>) -> CmdResult<Vec<C
 }
 
 #[tauri::command]
-fn undo(state: State<AppState>) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+fn undo(window: Window, state: State<AppState>) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
     doc.replay(false)?;
     Ok(info(&doc))
 }
 
 #[tauri::command]
-fn redo(state: State<AppState>) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+fn redo(window: Window, state: State<AppState>) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
     doc.replay(true)?;
     Ok(info(&doc))
 }
 
 #[tauri::command]
-fn add_sheet(state: State<AppState>) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+fn add_sheet(window: Window, state: State<AppState>) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
     doc.model.new_sheet()?;
     doc.record(1);
     Ok(info(&doc))
@@ -728,8 +799,13 @@ fn save_doc(doc: &mut Doc, path: Option<PathBuf>, sheet: u32) -> CmdResult<()> {
 }
 
 #[tauri::command]
-fn save_file(path: Option<String>, sheet: u32, state: State<AppState>) -> CmdResult<WorkbookInfo> {
-    let mut doc = state.doc();
+fn save_file(
+    path: Option<String>,
+    sheet: u32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
     save_doc(&mut doc, path.map(PathBuf::from), sheet)?;
     Ok(info(&doc))
 }
@@ -743,8 +819,14 @@ struct ActiveStyle {
 }
 
 #[tauri::command]
-fn get_active_style(sheet: u32, row: i32, col: i32, state: State<AppState>) -> CmdResult<ActiveStyle> {
-    let s = state.doc().model.get_cell_style(sheet, row, col)?;
+fn get_active_style(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<ActiveStyle> {
+    let s = state.doc(window.label()).model.get_cell_style(sheet, row, col)?;
     Ok(ActiveStyle {
         bold: s.font.b,
         italic: s.font.i,
@@ -762,9 +844,10 @@ fn get_range_text(
     height: i32,
     width: i32,
     raw: bool,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<Vec<Vec<String>>> {
-    let doc = state.doc();
+    let doc = state.doc(window.label());
     let dim = doc.model.get_model().workbook.worksheet(sheet)?.dimension();
     // No point in copying the empty space past the data
     let last_row = (row + height - 1).min(dim.max_row).max(row);
@@ -798,9 +881,10 @@ fn range_stats(
     col: i32,
     height: i32,
     width: i32,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<RangeStats> {
-    let doc = state.doc();
+    let doc = state.doc(window.label());
     let model = doc.model.get_model();
     let dim = model.workbook.worksheet(sheet)?.dimension();
     let mut stats = RangeStats::default();
@@ -831,8 +915,14 @@ struct RectDto {
 /// AutoSum heuristic: the run of numbers directly above (else directly left of)
 /// the cell, or `None` when there is nothing to total.
 #[tauri::command]
-fn autosum_range(sheet: u32, row: i32, col: i32, state: State<AppState>) -> Option<RectDto> {
-    autosum_in(state.doc().model.get_model(), sheet, row, col)
+fn autosum_range(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    window: Window,
+    state: State<AppState>,
+) -> Option<RectDto> {
+    autosum_in(state.doc(window.label()).model.get_model(), sheet, row, col)
 }
 
 #[derive(Serialize)]
@@ -849,11 +939,12 @@ fn preview_formula(
     row: i32,
     col: i32,
     formula: String,
+    window: Window,
     state: State<AppState>,
 ) -> CmdResult<FormulaPreview> {
     let mut cache = state.preview.lock().unwrap();
     let original = {
-        let doc = state.doc();
+        let doc = state.doc(window.label());
         if cache.as_ref().map_or(true, |(generation, _)| *generation != doc.generation) {
             let copy = Model::from_bytes(&doc.model.get_model().to_bytes(), LANG)?;
             *cache = Some((doc.generation, copy));
@@ -900,8 +991,121 @@ fn autosum_in(model: &Model, sheet: u32, row: i32, col: i32) -> Option<RectDto> 
 }
 
 #[tauri::command]
-fn take_pending_open(state: State<AppState>) -> Vec<String> {
-    std::mem::take(&mut *state.pending_open.lock().unwrap())
+fn take_pending_open(window: Window, state: State<AppState>) -> Vec<String> {
+    state
+        .pending_open
+        .lock()
+        .unwrap()
+        .get_mut(window.label())
+        .map(std::mem::take)
+        .unwrap_or_default()
+}
+
+static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
+
+/// Opens another window like the main one, which loads `path` once its webview is ready.
+fn open_window(app: &AppHandle, path: Option<String>) -> CmdResult<()> {
+    let label = format!("doc-{}", NEXT_WINDOW.fetch_add(1, Ordering::Relaxed));
+    build_window(app, label, path)
+}
+
+/// Window `label` shows the workbook stored under that label, empty when there is none yet.
+fn build_window(app: &AppHandle, label: String, path: Option<String>) -> CmdResult<()> {
+    let state = app.state::<AppState>();
+    let mut config = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or("No window configuration")?;
+    config.label = label.clone();
+    let mut builder = WebviewWindowBuilder::from_config(app, &config).map_err(|e| e.to_string())?;
+    // cascade from the window in front, like other document apps
+    if let Some(front) = app.get_webview_window(&state.active_label()) {
+        if let (Ok(pos), Ok(scale)) = (front.outer_position(), front.scale_factor()) {
+            let pos = pos.to_logical::<f64>(scale);
+            builder = builder.position(pos.x + 24.0, pos.y + 24.0);
+        }
+    }
+    if let Some(path) = path {
+        state.pending_open.lock().unwrap().insert(label.clone(), vec![path]);
+    }
+    builder.build().map_err(|e| {
+        state.pending_open.lock().unwrap().remove(&label);
+        e.to_string()
+    })?;
+    Ok(())
+}
+
+/// Brings forward the window that has `path` open, if any. A file lives in one window
+/// only, so two windows never save over each other.
+fn focus_window_with(app: &AppHandle, path: &str) -> bool {
+    let has_it = app
+        .state::<AppState>()
+        .docs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, d)| d.path.as_deref() == Some(Path::new(path)))
+        .map(|(label, _)| label.clone());
+    let Some(window) = has_it.and_then(|label| app.get_webview_window(&label)) else {
+        return false;
+    };
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    true
+}
+
+/// Shows `path` from Finder in the window that already has it open, else in an untouched
+/// window, else in a new window.
+fn route_open(app: &AppHandle, path: String) -> CmdResult<()> {
+    if focus_window_with(app, &path) {
+        return Ok(());
+    }
+    let state = app.state::<AppState>();
+    let active = state.active_label();
+    let mut labels: Vec<String> = app.webview_windows().into_keys().collect();
+    // the window in front first
+    labels.sort_by_key(|l| *l != active);
+    if let Some(label) = labels.into_iter().find(|l| state.is_untouched(l)) {
+        state.pending_open.lock().unwrap().insert(label.clone(), vec![path.clone()]);
+        let _ = app.emit_to(label.as_str(), "open-file", path);
+        return Ok(());
+    }
+    open_window(app, Some(path))
+}
+
+/// Opens a new window, empty or showing `path`, or focuses the window that has `path` open
+/// already. With `here` the calling window takes the file instead: then this returns true
+/// and the caller loads it.
+#[tauri::command]
+async fn open_in_window(path: Option<String>, here: bool, app: AppHandle) -> CmdResult<bool> {
+    let Some(path) = path else {
+        open_window(&app, None)?;
+        return Ok(false);
+    };
+    if focus_window_with(&app, &path) {
+        return Ok(false);
+    }
+    if here {
+        return Ok(true);
+    }
+    open_window(&app, Some(path))?;
+    Ok(false)
+}
+
+/// Open… with no window to ask from: every picked file gets a window of its own.
+fn pick_and_open(app: &AppHandle) {
+    let handle = app.clone();
+    app.dialog()
+        .file()
+        .add_filter("Spreadsheets", &["xlsx", "xlsm", "csv", "tsv", "txt"])
+        .pick_files(move |picked| {
+            for path in picked.into_iter().flatten().filter_map(|p| p.into_path().ok()) {
+                let _ = route_open(&handle, path.to_string_lossy().to_string());
+            }
+        });
 }
 
 fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
@@ -966,13 +1170,13 @@ pub fn mcp_stdio_bridge() -> i32 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let model = new_model("Untitled").expect("create empty workbook");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
-            doc: Mutex::new(Doc::new(model, None)),
-            pending_open: Mutex::new(Vec::new()),
+            docs: Mutex::new(HashMap::new()),
+            active: Mutex::new("main".into()),
+            pending_open: Mutex::new(HashMap::new()),
             mcp: Mutex::new(mcp::Runtime::load()),
             preview: Mutex::new(None),
         })
@@ -982,11 +1186,43 @@ pub fn run() {
             Ok(())
         })
         .on_menu_event(|app, event| {
-            let _ = app.emit("menu", event.id().0.clone());
+            let id = event.id().0.as_str();
+            if id == "new" {
+                let _ = open_window(app, None);
+                return;
+            }
+            // on macOS the app stays running with every window closed
+            if app.webview_windows().is_empty() {
+                if id == "open" {
+                    pick_and_open(app);
+                }
+                return;
+            }
+            // only the window in front acts on a menu command
+            let label = app.state::<AppState>().active_label();
+            let _ = app.emit_to(label.as_str(), "menu", id);
+        })
+        .on_window_event(|window, event| {
+            let state = window.state::<AppState>();
+            let label = window.label();
+            match event {
+                WindowEvent::Focused(true) => *state.active.lock().unwrap() = label.to_string(),
+                WindowEvent::Destroyed => {
+                    state.docs.lock().unwrap().remove(label);
+                    state.pending_open.lock().unwrap().remove(label);
+                    let mut active = state.active.lock().unwrap();
+                    if *active == label {
+                        let others = window.webview_windows().into_keys().find(|l| l != label);
+                        if let Some(next) = others {
+                            *active = next;
+                        }
+                    }
+                }
+                _ => {}
+            }
         })
         .invoke_handler(tauri::generate_handler![
             open_file,
-            new_file,
             workbook_info,
             get_layout,
             get_viewport,
@@ -1008,6 +1244,7 @@ pub fn run() {
             autosum_range,
             preview_formula,
             take_pending_open,
+            open_in_window,
             mcp::mcp_status,
             mcp::mcp_set_enabled,
             mcp::mcp_regenerate_token,
@@ -1016,20 +1253,22 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|handle, event| {
-        // Finder "Open With" / dropping a file on the Dock icon
         #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Opened { urls } = event {
-            use tauri::Manager;
-            for path in urls.iter().filter_map(|u| u.to_file_path().ok()) {
-                let path = path.to_string_lossy().to_string();
-                handle
-                    .state::<AppState>()
-                    .pending_open
-                    .lock()
-                    .unwrap()
-                    .push(path.clone());
-                let _ = handle.emit("open-file", path);
+        match event {
+            // Finder "Open With" / dropping a file on the Dock icon
+            tauri::RunEvent::Opened { urls } => {
+                for path in urls.iter().filter_map(|u| u.to_file_path().ok()) {
+                    let _ = route_open(handle, path.to_string_lossy().to_string());
+                }
             }
+            // the last window closed (Quit is `Some` or skips this): stay in the Dock like
+            // other Mac apps
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            // clicking the Dock icon with no window open
+            tauri::RunEvent::Reopen { .. } if handle.webview_windows().is_empty() => {
+                let _ = open_window(handle, None);
+            }
+            _ => {}
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (handle, event);
@@ -1084,6 +1323,21 @@ mod tests {
         assert!(!doc.model.can_undo());
         doc.replay(false).unwrap();
         assert_eq!(doc.model.get_formatted_cell_value(0, 2, 2).unwrap(), "2");
+    }
+
+    #[test]
+    fn only_an_untouched_empty_workbook_makes_way_for_a_file() {
+        assert!(Doc::empty().unwrap().is_blank());
+        let mut edited = Doc::empty().unwrap();
+        write_cells(&mut edited, 0, 1, 1, &[vec!["x".into()]]).unwrap();
+        edited.replay(false).unwrap();
+        // undone back to empty, but still the user's work
+        assert!(!edited.is_blank());
+
+        let csv = tmp("blank.csv");
+        fs::write(&csv, "a\n").unwrap();
+        // an imported CSV has no path, yet it is not blank
+        assert!(!Doc::new(load_csv(&csv).unwrap(), None).is_blank());
     }
 
     #[test]

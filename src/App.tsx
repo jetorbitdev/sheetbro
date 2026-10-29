@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
@@ -161,24 +160,24 @@ export function App() {
     }
   };
 
-  const doOpen = async () => {
-    const picked = await open({
-      multiple: false,
-      filters: [{ name: "Spreadsheets", extensions: ["xlsx", "xlsm", "csv", "tsv", "txt"] }],
-    });
-    if (typeof picked === "string") await openPath(picked);
+  /** The first file replaces an untouched empty workbook; the others get windows of their own. */
+  const openPaths = async (paths: string[]) => {
+    for (const [i, path] of paths.entries()) {
+      try {
+        const here = await api.openInWindow(path, i === 0 && !!info?.blank);
+        if (here) await openPath(path);
+      } catch (e) {
+        showError(e);
+      }
+    }
   };
 
-  const doNew = async () => {
-    if (!(await confirmDiscard())) return;
-    try {
-      const i = await api.newFile();
-      resetView();
-      setBlank(true);
-      applyInfo(i);
-    } catch (e) {
-      showError(e);
-    }
+  const doOpen = async () => {
+    const picked = await open({
+      multiple: true,
+      filters: [{ name: "Spreadsheets", extensions: ["xlsx", "xlsm", "csv", "tsv", "txt"] }],
+    });
+    if (picked) await openPaths(picked);
   };
 
   const doSaveAs = async () => {
@@ -580,7 +579,7 @@ export function App() {
     }
     if (editing && id.startsWith("merge")) return;
     switch (id) {
-      case "new": return doNew();
+      case "new": return api.openInWindow(null).catch(showError);
       case "open": return doOpen();
       case "save": return doSave();
       case "save_as": return doSaveAs();
@@ -604,6 +603,8 @@ export function App() {
   commandRef.current = handleCommand;
   const openRef = useRef(openPath);
   openRef.current = openPath;
+  const openPathsRef = useRef(openPaths);
+  openPathsRef.current = openPaths;
   const dirtyRef = useRef(false);
   dirtyRef.current = info?.dirty ?? false;
 
@@ -619,33 +620,34 @@ export function App() {
   changedRef.current = onWorkbookChanged;
 
   useEffect(() => {
+    // only events sent to this window: every window has its own workbook
+    const win = getCurrentWindow();
     const unlisten: Promise<() => void>[] = [
-      listen<string>("menu", (e) => commandRef.current(e.payload)),
-      listen<string>("open-file", (e) => openRef.current(e.payload)),
-      listen<WorkbookChange>("workbook-changed", (e) => changedRef.current(e.payload)),
+      win.listen<string>("menu", (e) => commandRef.current(e.payload)),
+      win.listen<string>("open-file", (e) => openRef.current(e.payload)),
+      win.listen<WorkbookChange>("workbook-changed", (e) => changedRef.current(e.payload)),
       getCurrentWebview().onDragDropEvent((e) => {
         const t = e.payload.type;
         if (t === "enter" || t === "over") setDropping(true);
         else if (t === "leave") setDropping(false);
         else if (t === "drop") {
           setDropping(false);
-          const first = e.payload.paths[0];
-          if (first) openRef.current(first);
+          void openPathsRef.current(e.payload.paths);
         }
       }),
-      getCurrentWindow().onCloseRequested(async (e) => {
+      win.onCloseRequested(async (e) => {
         if (!dirtyRef.current) return;
         e.preventDefault();
-        const discard = await ask("This workbook has unsaved changes. Quit without saving?", {
+        const discard = await ask("This workbook has unsaved changes. Close it without saving?", {
           title: "Unsaved changes",
           kind: "warning",
-          okLabel: "Quit",
+          okLabel: "Close",
           cancelLabel: "Cancel",
         });
-        if (discard) await getCurrentWindow().destroy();
+        if (discard) await win.destroy();
       }),
     ];
-    // files opened from Finder before we were listening
+    // the file this window was opened for, handed over before we were listening
     api.takePendingOpen().then((paths) => {
       if (paths[0]) void openRef.current(paths[0]);
     });

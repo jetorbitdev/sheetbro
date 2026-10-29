@@ -3,15 +3,17 @@
 //! HTTP clients (Claude Code, Cursor, VS Code, ...) talk to `POST /mcp` on 127.0.0.1 with a
 //! bearer token. Clients that only speak stdio (Claude Desktop, Codex, ...) launch this same
 //! binary with `--mcp-stdio`, which relays every message to that endpoint. Both paths end in
-//! `handle_message`, so the tools behave the same everywhere. Every edit lands in the undo
-//! history like a user edit and is pushed to the window through the `workbook-changed` event.
+//! `handle_message`, so the tools behave the same everywhere. The tools act on the workbook of
+//! the window that last had focus. Every edit lands in the undo history like a user edit and is
+//! pushed to that window through the `workbook-changed` event.
 
 use std::{
     fs,
     io::{self, BufRead, Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    ops::DerefMut,
+    sync::{Arc, Mutex},
     thread::JoinHandle,
     time::Duration,
 };
@@ -22,7 +24,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::{info, AppState, CmdResult, Doc, WorkbookInfo};
+use crate::{info, AppState, CmdResult, Doc, DocGuard, WorkbookInfo};
 
 pub const DEFAULT_PORT: u16 = 7424;
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -97,8 +99,11 @@ impl Config {
 // ------------------------------------------------------------------- runtime
 
 /// What the app needs from the outside world, so the server can run against a test double.
-pub trait Host: Send + Sync + 'static {
-    fn lock(&self) -> MutexGuard<'_, Doc>;
+pub(crate) trait Host: Send + Sync + 'static {
+    type Guard<'a>: DerefMut<Target = Doc>
+    where
+        Self: 'a;
+    fn lock(&self) -> Self::Guard<'_>;
     /// Called after a tool changed the workbook, with the lock released.
     fn changed(&self, change: Change);
 }
@@ -120,15 +125,26 @@ struct ChangeEvent {
 }
 
 impl Host for TauriHost {
-    fn lock(&self) -> MutexGuard<'_, Doc> {
-        self.0.state::<AppState>().inner().doc()
+    type Guard<'a> = DocGuard<'a>;
+
+    fn lock(&self) -> DocGuard<'_> {
+        self.0.state::<AppState>().inner().active_doc()
     }
 
     fn changed(&self, change: Change) {
-        let info = info(&self.lock());
-        let _ = self
-            .0
-            .emit("workbook-changed", ChangeEvent { replaced: change == Change::Replaced, info });
+        let state = self.0.state::<AppState>();
+        let label = state.active_label();
+        // every window was closed: show the workbook the tool just changed
+        if self.0.get_webview_window(&label).is_none() {
+            let _ = crate::build_window(&self.0, label, None);
+            return;
+        }
+        let info = info(&state.doc(&label));
+        let _ = self.0.emit_to(
+            label.as_str(),
+            "workbook-changed",
+            ChangeEvent { replaced: change == Change::Replaced, info },
+        );
     }
 }
 
@@ -441,7 +457,8 @@ fn initialize(params: &Value) -> Value {
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "sheetbro", "title": "SheetBro", "version": env!("CARGO_PKG_VERSION") },
         "instructions": "SheetBro is a spreadsheet app. These tools read and edit the workbook the user \
-            has open, live in their window. Cells use A1 notation; a value starting with '=' is a formula. \
+            has open, live in their window (the one in front when several are open). Cells use A1 \
+            notation; a value starting with '=' is a formula. \
             Call workbook_info first to see the sheets and how far the data extends. Every edit is one \
             undo step (the user can press Cmd+Z, or you can call undo)."
     })
@@ -1177,6 +1194,7 @@ fn post(port: u16, token: &str, body: &str) -> Result<(u16, String), String> {
 mod tests {
     use super::*;
     use crate::new_model;
+    use std::sync::MutexGuard;
 
     struct TestHost {
         doc: Mutex<Doc>,
@@ -1193,6 +1211,8 @@ mod tests {
     }
 
     impl Host for TestHost {
+        type Guard<'a> = MutexGuard<'a, Doc>;
+
         fn lock(&self) -> MutexGuard<'_, Doc> {
             self.doc.lock().unwrap()
         }

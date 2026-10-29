@@ -13,6 +13,8 @@ export interface WorkbookInfo {
   sheets: SheetInfo[];
   can_undo: boolean;
   can_redo: boolean;
+  /** untouched empty workbook: a file opened now replaces it instead of getting a new window */
+  blank: boolean;
 }
 
 /** 1-based anchor plus size of a merged range */
@@ -96,7 +98,6 @@ const rectArgs = (r: Rect) => r;
 
 export const api = {
   openFile: (path: string) => invoke<WorkbookInfo>("open_file", { path }),
-  newFile: () => invoke<WorkbookInfo>("new_file"),
   workbookInfo: () => invoke<WorkbookInfo>("workbook_info"),
   getLayout: (sheet: number) => invoke<Layout>("get_layout", { sheet }),
   getViewport: (
@@ -139,6 +140,12 @@ export const api = {
   saveFile: (path: string | null, sheet: number) =>
     invoke<WorkbookInfo>("save_file", { path, sheet }),
   takePendingOpen: () => invoke<string[]>("take_pending_open"),
+  /**
+   * Opens another window, empty or showing `path`, or focuses the window that has `path` open.
+   * With `here`, true means this window should load `path` itself.
+   */
+  openInWindow: (path: string | null, here = false) =>
+    invoke<boolean>("open_in_window", { path, here }),
   mcpStatus: () => invoke<McpStatus>("mcp_status"),
   mcpSetEnabled: (enabled: boolean, port?: number) =>
     invoke<McpStatus>("mcp_set_enabled", { enabled, port }),
