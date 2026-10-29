@@ -147,6 +147,17 @@ sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file \
 sudo dnf group install "c-development"
 ```
 
+RHEL family (RHEL, AlmaLinux, Rocky Linux 10 or later). WebKitGTK 4.1 comes from EPEL.
+Version 9 only ships WebKitGTK 4.0, which Tauri 2 doesn't support, so SheetBro can't be
+built or run there.
+
+```sh
+sudo dnf install epel-release dnf-plugins-core   # on RHEL itself, install EPEL from the Fedora docs
+sudo dnf config-manager --set-enabled crb
+sudo dnf install gcc gcc-c++ make curl file openssl-devel \
+  webkit2gtk4.1-devel librsvg2-devel libappindicator-gtk3-devel
+```
+
 Arch:
 
 ```sh
@@ -158,10 +169,82 @@ Then build:
 
 ```sh
 pnpm tauri build --bundles deb,appimage   # .deb in bundle/deb, .AppImage in bundle/appimage
-pnpm tauri build --bundles rpm            # .rpm in bundle/rpm (Fedora, openSUSE)
+pnpm tauri build --bundles rpm            # .rpm in bundle/rpm (Fedora, RHEL family)
 ```
 
 The plain executable is at `src-tauri/target/release/spritsit`.
+
+### Building with GitHub Actions
+
+The [Release (Windows & Linux)](.github/workflows/release.yml) workflow builds the
+installers that aren't built locally:
+
+| Runner | Installers |
+|---|---|
+| `windows-latest` | `.exe` (NSIS) and `.msi` |
+| `ubuntu-22.04` | `.deb` and `.AppImage` |
+| AlmaLinux 10 container | `.rpm` for Fedora and the RHEL family |
+
+Run it from the **Actions** tab. With **release** off, the installers are uploaded as workflow
+artifacts, which is useful for checking that a change still builds. With **release** on, they
+are attached to a draft GitHub release for the version in `src-tauri/tauri.conf.json`. The
+release title and notes come from that version's entry in the [changelog](#changelog), so add
+the entry first. Upload the notarized macOS `.dmg` to the same draft, then publish it.
+
+The Windows installers aren't code-signed yet, so Windows SmartScreen warns before running
+them.
+
+### Prompt templates for AI agents
+
+To have an AI coding agent (Claude Code, Cursor, Codex and so on) build SheetBro for you,
+open it in the cloned repository and paste the prompt for your OS.
+
+macOS:
+
+```text
+Build SheetBro from this repository on macOS. Follow "Building from source" in README.md.
+1. Check that Xcode Command Line Tools, Rust (stable), Node.js 20.19+ or 22.12+ and pnpm
+   are installed. Install whatever is missing, and ask me before running anything with sudo.
+2. Run `pnpm install`, then `pnpm tauri build`.
+3. If the build fails, read the error, fix the cause and build again. Don't change app code
+   unless the error is in it, and tell me what you changed.
+4. When it's done, give me the paths of SheetBro.app and the .dmg in
+   src-tauri/target/release/bundle.
+```
+
+Windows:
+
+```text
+Build SheetBro from this repository on Windows. Follow the "Windows" part of
+"Building from source" in README.md, and use PowerShell.
+1. Check that the Microsoft C++ Build Tools (Desktop development with C++), WebView2,
+   Rust with the stable-msvc toolchain, Node.js 20.19+ or 22.12+ and pnpm are installed.
+   Tell me what's missing and how to install it, or install it with winget if I agree.
+2. Run `pnpm install`, then `pnpm tauri build --bundles nsis,msi`.
+3. If the build fails, read the error, fix the cause and build again. Don't change app code
+   unless the error is in it, and tell me what you changed.
+4. When it's done, give me the paths of the setup .exe and the .msi in
+   src-tauri\target\release\bundle.
+```
+
+Linux:
+
+```text
+Build SheetBro from this repository on Linux. Follow the "Linux" part of
+"Building from source" in README.md.
+1. Find out which distribution and version I'm running from /etc/os-release. If it's
+   RHEL, AlmaLinux or Rocky Linux older than 10, stop and tell me it isn't supported.
+2. Install the system packages listed for my distribution, then check that Rust (stable),
+   Node.js 20.19+ or 22.12+ and pnpm are installed. Ask me before running anything with sudo.
+3. Run `pnpm install`, then build the package format that fits my distribution:
+   `pnpm tauri build --bundles deb,appimage` on Debian or Ubuntu,
+   `pnpm tauri build --bundles rpm` on Fedora or the RHEL family,
+   `pnpm tauri build --bundles appimage` on anything else.
+4. If the build fails, read the error, fix the cause and build again. Don't change app code
+   unless the error is in it, and tell me what you changed.
+5. When it's done, give me the paths of the packages in src-tauri/target/release/bundle and
+   the command to install them.
+```
 
 ## Project structure
 

@@ -1,0 +1,143 @@
+# Builds the Windows and Linux installers. The macOS .dmg is built and notarized locally.
+#
+# Run it from the Actions tab. With "release" off, the installers are only uploaded as
+# workflow artifacts. With it on, they are attached to a draft GitHub release for the
+# version in tauri.conf.json, titled and described from the README changelog. Nothing is
+# public until the draft is published.
+name: Release (Windows & Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Attach the installers to a draft GitHub release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            bundles: nsis,msi
+          # 22.04 keeps the glibc requirement low, so the .deb and .AppImage run on older distros.
+          - name: linux
+            os: ubuntu-22.04
+            bundles: deb,appimage
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri build --bundles ${{ matrix.bundles }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sheetbro-${{ matrix.name }}
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  # The .rpm is built on EL10, the first RHEL release with WebKitGTK 4.1 (from EPEL).
+  # RHEL 9 and its rebuilds only ship WebKitGTK 4.0, which Tauri 2 can't use.
+  build-rhel:
+    name: build (rhel)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y epel-release dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y git gcc gcc-c++ make file openssl-devel \
+            webkit2gtk4.1-devel librsvg2-devel libappindicator-gtk3-devel
+
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri build --bundles rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sheetbro-rhel
+          path: src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+
+  release:
+    if: inputs.release
+    needs: [build, build-rhel]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Attach installers to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(jq -r .version src-tauri/tauri.conf.json)"
+
+          # The README changelog heading is "### <tag> — <title>", followed by the
+          # conventional-commit bullets the website's changelog page parses.
+          heading=$(grep -m1 -E "^### $tag( |$)" README.md || true)
+          if [ -z "$heading" ]; then
+            echo "::error::README.md has no changelog entry for $tag"
+            exit 1
+          fi
+          title=${heading#"### $tag — "}
+          [ "$title" = "$heading" ] && title=$tag
+          notes=$(awk -v h="$heading" '$0 == h { f = 1; next } f && /^#/ { exit } f && /^- / { print }' README.md)
+
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != "true" ]; then
+              echo "::error::$tag is already published"
+              exit 1
+            fi
+            gh release upload "$tag" installers/* --clobber
+          else
+            gh release create "$tag" installers/* --draft --target "$GITHUB_SHA" \
+              --title "$title" --notes "$notes"
+          fi
