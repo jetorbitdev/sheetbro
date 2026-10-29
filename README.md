@@ -1,6 +1,6 @@
 # SheetBro
 
-A fast, native spreadsheet app for macOS that your AI assistant can work in.
+A fast, native spreadsheet app for macOS, Windows and Linux that your AI assistant can work in.
 
 SheetBro opens and saves Excel (`.xlsx`) and CSV files, calculates formulas with
 [IronCalc](https://github.com/ironcalc/IronCalc), and runs a built-in
@@ -9,6 +9,21 @@ and edit the workbook you have open. You can see every change they make as it ha
 undo it with <kbd>⌘Z</kbd>.
 
 ![SheetBro with a Q3 sales report open, next to a Claude Code session that adds a revenue-by-region summary to the sheet through SheetBro's MCP tools](docs/screenshot.png)
+
+## Download
+
+Get the installer for your OS from the
+[latest release](https://github.com/jetorbitdev/sheetbro/releases/latest):
+
+| OS | File |
+|---|---|
+| Windows 10 or 11 | `.exe` setup or `.msi` |
+| Debian, Ubuntu | `.deb`, or the `.AppImage` on any other distribution |
+| Fedora, RHEL family 10 or later | `.rpm` (on RHEL, AlmaLinux and Rocky Linux, enable EPEL first) |
+| macOS 11 or later | `.dmg`, coming soon. Until then, [build from source](#building-from-source). |
+
+The Windows installers aren't code-signed yet, so SmartScreen shows a warning. Choose
+**More info**, then **Run anyway**.
 
 ## Features
 
@@ -280,7 +295,7 @@ can label it New, Fix, Perf or Docs.
 
 ### v0.1.0 — First public release
 
-_Unreleased_
+_October 29, 2026_
 
 - feat: Open .xlsx, .xlsm, .csv and .tsv files, by dialog, drag and drop, or from Finder
 - feat: Save as .xlsx, and export a sheet as .csv
@@ -291,6 +306,7 @@ _Unreleased_
 - feat: Sum, average and count of the selected range
 - feat: Built-in MCP server over Streamable HTTP and stdio, with ready-made setup for Claude, Cursor, VS Code, Windsurf, Gemini CLI and Codex CLI
 - feat: AI edits go into the normal undo history
+- feat: Installers for Windows (.exe, .msi) and Linux (.deb, .AppImage, .rpm)
 - docs: Build instructions for macOS, Windows and Linux
 
 ## Contributing
