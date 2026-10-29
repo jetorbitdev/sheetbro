@@ -320,7 +320,9 @@ as the tag, the title as the release name, and paste the bullet list as the rele
 Keep one change per line and start it with `feat:`, `fix:`, `perf:` or `docs:`, so the website
 can label it New, Fix, Perf or Docs.
 
-### Unreleased
+### v0.3.0 — Faster, fuller AI tools
+
+_October 29, 2026_
 
 - feat: MCP `batch` tool that runs many edits as one call and one undo step, and `range` accepts several comma-separated ranges
 - feat: MCP `set_layout` for column widths (with auto-fit), row heights, frozen panes, merge and unmerge

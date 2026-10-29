@@ -1,6 +1,6 @@
 [package]
 name = "spritsit"
-version = "0.2.0"
+version = "0.3.0"
 description = "Spreadsheet app built with Tauri"
 license = "MIT"
 edition = "2021"
