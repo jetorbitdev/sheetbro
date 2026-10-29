@@ -71,14 +71,38 @@ claude mcp add --transport http sheetbro http://127.0.0.1:7424/mcp \
 | Tool | What it does |
 |---|---|
 | `workbook_info` | File name, path, unsaved-changes flag, and the sheets with their used size |
-| `read_range` | Reads cells as displayed text, or as formulas |
+| `read_range` | Reads cells as displayed text, as formulas, or as typed values (numbers, booleans, dates, errors). Can also return formats, column widths, row heights, merges and frozen panes |
 | `write_range` | Writes a grid of values and formulas, and reports any formula errors |
-| `clear_range` | Clears cell contents and keeps formatting |
-| `format_range` | Bold, italic, underline, colors, alignment, number format |
-| `add_sheet` | Adds an empty sheet |
+| `clear_range` | Clears contents, formats, or both, in one or several ranges |
+| `format_range` | Bold, italic, underline, strikethrough, colors, alignment, number format, font size, wrapping and borders, on one or several ranges |
+| `set_layout` | Column widths (or `auto` to fit the text), row heights, frozen panes, merge and unmerge |
+| `insert_lines` / `delete_lines` | Inserts or deletes rows or columns; formulas follow the cells that move |
+| `add_sheet` / `rename_sheet` / `move_sheet` / `delete_sheet` | Adds a sheet with a name, renames it, reorders the tabs, or deletes a sheet |
+| `batch` | Runs a list of the editing tools above as one call and one undo step. All or nothing |
 | `undo` / `redo` | Undoes or redoes the last edit, whether it was made by you or the AI |
 | `open_workbook` | Opens a file. It refuses to discard unsaved changes unless asked to. |
 | `save_workbook` | Saves the file, or saves to a new path. It won't overwrite an existing file unless asked to. |
+
+Notes for people writing prompts or building clients:
+
+- **Fewer round trips are faster.** Every call is one trip to the app. Use `batch` to do many
+  edits at once, and give `range` several comma-separated ranges (`"A1:H1,A9:H9"`). A batch
+  is also a single undo step, so one Cmd+Z reverts the whole job.
+- **Formats the window doesn't draw yet.** Font size, strikethrough, wrapping, vertical
+  alignment, borders and frozen panes are saved in the workbook and in the exported `.xlsx`,
+  but SheetBro's own grid doesn't draw them yet. Open the file in Excel, LibreOffice or Google
+  Sheets to see them. The tool result says so when you use one of them. There is no font family
+  option because the spreadsheet engine doesn't support one.
+- **Number separators.** A format like `#,##0` is stored in the file as is, and Excel and
+  LibreOffice show it with the separators of the system they run on (3.000.000 on an Indonesian
+  one). SheetBro's own window always shows English separators (3,000,000). The engine only
+  ships the locales `en`, `en-GB`, `de`, `fr`, `es` and `it`, so there is no Indonesian locale
+  to switch to yet. Typed reads (`typed: true`) return plain numbers, so they don't depend on
+  any of this.
+- **Sorting.** There is no sort tool. To sort, read the range with `typed: true`, sort it in
+  your own code and write it back with `write_range`.
+- **Unsaved work.** Edits live in the open window until `save_workbook` runs. Every edit result
+  carries `unsaved_changes`, so a client can remind the user to save.
 
 ### Security
 
@@ -295,6 +319,18 @@ changelog page on the SheetBro website gets its entries. To publish one, use the
 as the tag, the title as the release name, and paste the bullet list as the release notes.
 Keep one change per line and start it with `feat:`, `fix:`, `perf:` or `docs:`, so the website
 can label it New, Fix, Perf or Docs.
+
+### Unreleased
+
+- feat: MCP `batch` tool that runs many edits as one call and one undo step, and `range` accepts several comma-separated ranges
+- feat: MCP `set_layout` for column widths (with auto-fit), row heights, frozen panes, merge and unmerge
+- feat: MCP tools to insert and delete rows and columns, and to name, rename, move and delete sheets
+- feat: MCP `format_range` also sets font size, strikethrough, wrapping, vertical alignment and borders
+- feat: MCP `read_range` can return typed values (numbers, booleans, dates, errors) and the formatting, widths, merges and frozen panes
+- feat: MCP `clear_range` can clear formatting, or both contents and formatting
+- fix: A tool that fails inside the app no longer takes the whole app down
+- fix: Quitting with Cmd+Q asks before discarding unsaved changes
+- docs: Notes on batching, formats the grid doesn't draw yet, number separators and sorting
 
 ### v0.2.0 — Right-click menu and moving cells
 

@@ -7,8 +7,8 @@ use std::{
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex, MutexGuard, PoisonError,
     },
 };
 
@@ -31,7 +31,7 @@ use tauri::{
     menu::{Menu, MenuItemBuilder, SubmenuBuilder},
     AppHandle, Emitter, Manager, Runtime, State, WebviewWindowBuilder, Window, WindowEvent,
 };
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 const MAX_ROW: i32 = 1_048_576;
 const MAX_COL: i32 = 16_384;
@@ -153,7 +153,7 @@ impl DerefMut for DocGuard<'_> {
 impl AppState {
     /// The workbook of window `label`; a window starts with an empty one.
     fn doc(&self, label: &str) -> DocGuard<'_> {
-        let mut docs = self.docs.lock().unwrap();
+        let mut docs = self.docs.lock_recovering();
         if !docs.contains_key(label) {
             docs.insert(label.to_string(), Doc::empty().expect("create empty workbook"));
         }
@@ -161,7 +161,7 @@ impl AppState {
     }
 
     fn active_label(&self) -> String {
-        self.active.lock().unwrap().clone()
+        self.active.lock_recovering().clone()
     }
 
     fn active_doc(&self) -> DocGuard<'_> {
@@ -170,12 +170,25 @@ impl AppState {
 
     /// A window with nothing in it yet and no file on its way.
     fn is_untouched(&self, label: &str) -> bool {
-        !self.pending_open.lock().unwrap().contains_key(label)
-            && self.docs.lock().unwrap().get(label).map_or(true, Doc::is_blank)
+        !self.pending_open.lock_recovering().contains_key(label)
+            && self.docs.lock_recovering().get(label).map_or(true, Doc::is_blank)
     }
 }
 
 type CmdResult<T> = Result<T, String>;
+
+/// Locks a mutex even when a thread panicked while holding it. One tool call that panicked
+/// must not make every later lock panic too, which would take the whole app down with the
+/// unsaved work in it.
+trait LockExt<T> {
+    fn lock_recovering(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn lock_recovering(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Builds the workbook on a plain `Model` so nothing lands in the undo history
 /// (`UserModel::set_name` and `set_user_input` both record undo entries).
@@ -1538,7 +1551,7 @@ fn preview_formula(
     window: Window,
     state: State<AppState>,
 ) -> CmdResult<FormulaPreview> {
-    let mut cache = state.preview.lock().unwrap();
+    let mut cache = state.preview.lock_recovering();
     let original = {
         let doc = state.doc(window.label());
         if cache.as_ref().map_or(true, |(generation, _)| *generation != doc.generation) {
@@ -1625,10 +1638,10 @@ fn build_window(app: &AppHandle, label: String, path: Option<String>) -> CmdResu
         }
     }
     if let Some(path) = path {
-        state.pending_open.lock().unwrap().insert(label.clone(), vec![path]);
+        state.pending_open.lock_recovering().insert(label.clone(), vec![path]);
     }
     builder.build().map_err(|e| {
-        state.pending_open.lock().unwrap().remove(&label);
+        state.pending_open.lock_recovering().remove(&label);
         e.to_string()
     })?;
     Ok(())
@@ -1665,7 +1678,7 @@ fn route_open(app: &AppHandle, path: String) -> CmdResult<()> {
     // the window in front first
     labels.sort_by_key(|l| *l != active);
     if let Some(label) = labels.into_iter().find(|l| state.is_untouched(l)) {
-        state.pending_open.lock().unwrap().insert(label.clone(), vec![path.clone()]);
+        state.pending_open.lock_recovering().insert(label.clone(), vec![path.clone()]);
         let _ = app.emit_to(label.as_str(), "open-file", path);
         return Ok(());
     }
@@ -1702,6 +1715,43 @@ fn pick_and_open(app: &AppHandle) {
                 let _ = route_open(&handle, path.to_string_lossy().to_string());
             }
         });
+}
+
+/// Set once the user agreed to quit with unsaved changes, so the exit that follows goes through.
+static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
+/// A "quit anyway?" question is on screen, so a second quit request does not stack another.
+static QUIT_ASKING: AtomicBool = AtomicBool::new(false);
+
+/// Quitting the app (Cmd+Q) closes every window without the per-window "unsaved changes" question,
+/// and takes the MCP server down with them. Returns true when the quit has to wait for an answer.
+fn hold_quit_for_unsaved_changes(app: &AppHandle) -> bool {
+    if QUIT_CONFIRMED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let unsaved = app.state::<AppState>().docs.lock_recovering().values().filter(|d| d.dirty).count();
+    if unsaved == 0 {
+        return false;
+    }
+    if !QUIT_ASKING.swap(true, Ordering::SeqCst) {
+        let text = match unsaved {
+            1 => "1 workbook has unsaved changes. Quit without saving it?".to_string(),
+            n => format!("{n} workbooks have unsaved changes. Quit without saving them?"),
+        };
+        let handle = app.clone();
+        app.dialog()
+            .message(text)
+            .title("Unsaved changes")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom("Quit".into(), "Cancel".into()))
+            .show(move |quit| {
+                QUIT_ASKING.store(false, Ordering::SeqCst);
+                if quit {
+                    QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                    handle.exit(0);
+                }
+            });
+    }
+    true
 }
 
 fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
@@ -1802,11 +1852,11 @@ pub fn run() {
             let state = window.state::<AppState>();
             let label = window.label();
             match event {
-                WindowEvent::Focused(true) => *state.active.lock().unwrap() = label.to_string(),
+                WindowEvent::Focused(true) => *state.active.lock_recovering() = label.to_string(),
                 WindowEvent::Destroyed => {
-                    state.docs.lock().unwrap().remove(label);
-                    state.pending_open.lock().unwrap().remove(label);
-                    let mut active = state.active.lock().unwrap();
+                    state.docs.lock_recovering().remove(label);
+                    state.pending_open.lock_recovering().remove(label);
+                    let mut active = state.active.lock_recovering();
                     if *active == label {
                         let others = window.webview_windows().into_keys().find(|l| l != label);
                         if let Some(next) = others {
@@ -1857,6 +1907,12 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+            if hold_quit_for_unsaved_changes(handle) {
+                api.prevent_exit();
+                return;
+            }
+        }
         #[cfg(target_os = "macos")]
         match event {
             // Finder "Open With" / dropping a file on the Dock icon
