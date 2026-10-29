@@ -67,26 +67,101 @@ claude mcp add --transport http sheetbro http://127.0.0.1:7424/mcp \
 - The server is **off by default**. When it is on, it listens only on `127.0.0.1`.
 - HTTP requests need a random access token. You can generate a new one from the panel, and
   clients using the old token are then locked out.
-- Settings are stored in `~/Library/Application Support/com.jetorbit.spritsit/mcp.json`.
+- Settings are stored in `mcp.json` inside a `com.jetorbit.spritsit` folder in your config
+  directory: `~/Library/Application Support` on macOS, `%APPDATA%` on Windows, and
+  `~/.config` on Linux.
 - Every AI edit goes into the normal undo history.
 
 ## Building from source
 
-Requirements:
+SheetBro is built with [Tauri 2](https://tauri.app). It is developed and tested on macOS.
+Windows and Linux builds work, but they get less testing, and opening a file by
+double-clicking it in Explorer or a file manager isn't handled yet.
 
-- macOS 11 or later
+On every OS you need:
+
 - [Rust](https://rustup.rs) (stable)
 - [Node.js](https://nodejs.org) 20.19+ or 22.12+ and [pnpm](https://pnpm.io)
-- Xcode Command Line Tools (`xcode-select --install`)
+
+Then install the OS-specific requirements below, and get the source:
 
 ```sh
 git clone https://github.com/jetorbitdev/sheetbro.git
 cd sheetbro
 pnpm install
-
 pnpm tauri dev      # run in development mode
-pnpm tauri build    # build SheetBro.app and a .dmg into src-tauri/target/release/bundle
 ```
+
+`tauri.conf.json` only lists the macOS bundle formats, so on Windows and Linux pass
+`--bundles` to choose an installer format. All bundles are written to
+`src-tauri/target/release/bundle/`.
+
+### macOS
+
+Requirements:
+
+- macOS 11 or later
+- Xcode Command Line Tools (`xcode-select --install`)
+
+```sh
+pnpm tauri build    # SheetBro.app in bundle/macos, a .dmg in bundle/dmg
+```
+
+### Windows
+
+Requirements:
+
+- Windows 10 or 11 (64-bit)
+- [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  with the **Desktop development with C++** workload
+- [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/). It is already
+  installed on Windows 11 and up-to-date Windows 10.
+- The MSVC Rust toolchain: `rustup default stable-msvc`
+
+In PowerShell:
+
+```powershell
+pnpm tauri build --bundles nsis   # setup .exe in bundle\nsis
+pnpm tauri build --bundles msi    # .msi in bundle\msi (downloads the WiX toolset on first run)
+```
+
+The plain executable is at `src-tauri\target\release\spritsit.exe`.
+
+### Linux
+
+Install the WebKitGTK and build dependencies for your distribution.
+
+Debian / Ubuntu (22.04 or later):
+
+```sh
+sudo apt update
+sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+Fedora:
+
+```sh
+sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file \
+  libappindicator-gtk3-devel librsvg2-devel libxdo-devel
+sudo dnf group install "c-development"
+```
+
+Arch:
+
+```sh
+sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget file openssl \
+  appmenu-gtk-module libappindicator-gtk3 librsvg xdotool
+```
+
+Then build:
+
+```sh
+pnpm tauri build --bundles deb,appimage   # .deb in bundle/deb, .AppImage in bundle/appimage
+pnpm tauri build --bundles rpm            # .rpm in bundle/rpm (Fedora, openSUSE)
+```
+
+The plain executable is at `src-tauri/target/release/spritsit`.
 
 ## Project structure
 
@@ -110,6 +185,30 @@ After you bump the `ironcalc` dependency, regenerate the function list:
 cd src-tauri && cargo fetch && cd ..
 python3 scripts/gen_functions.py
 ```
+
+## Changelog
+
+Each release below is also published as a
+[GitHub release](https://github.com/jetorbitdev/sheetbro/releases), which is where the
+changelog page on the SheetBro website gets its entries. To publish one, use the version
+as the tag, the title as the release name, and paste the bullet list as the release notes.
+Keep one change per line and start it with `feat:`, `fix:`, `perf:` or `docs:`, so the website
+can label it New, Fix, Perf or Docs.
+
+### v0.1.0 — First public release
+
+_Unreleased_
+
+- feat: Open .xlsx, .xlsm, .csv and .tsv files, by dialog, drag and drop, or from Finder
+- feat: Save as .xlsx, and export a sheet as .csv
+- feat: Almost 500 Excel functions with a function menu, live formula preview and AutoSum
+- feat: Bold, italic, underline, text and fill colors, alignment, number formats and merged cells
+- feat: Keyboard navigation, copy and paste with other spreadsheet apps, column auto-fit and multiple sheets
+- feat: Each workbook opens in its own window; on macOS the app stays in the Dock when the last one closes
+- feat: Sum, average and count of the selected range
+- feat: Built-in MCP server over Streamable HTTP and stdio, with ready-made setup for Claude, Cursor, VS Code, Windsurf, Gemini CLI and Codex CLI
+- feat: AI edits go into the normal undo history
+- docs: Build instructions for macOS, Windows and Linux
 
 ## Contributing
 
