@@ -131,13 +131,16 @@ jobs:
           [ "$title" = "$heading" ] && title=$tag
           notes=$(awk -v h="$heading" '$0 == h { f = 1; next } f && /^#/ { exit } f && /^- / { print }' README.md)
 
+          # Artifacts keep the bundle subfolders (nsis/, deb/, ...), so collect the files.
+          mapfile -t files < <(find installers -type f)
+
           if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$draft" != "true" ]; then
               echo "::error::$tag is already published"
               exit 1
             fi
-            gh release upload "$tag" installers/* --clobber
+            gh release upload "$tag" "${files[@]}" --clobber
           else
-            gh release create "$tag" installers/* --draft --target "$GITHUB_SHA" \
+            gh release create "$tag" "${files[@]}" --draft --target "$GITHUB_SHA" \
               --title "$title" --notes "$notes"
           fi
