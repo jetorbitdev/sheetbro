@@ -37,6 +37,9 @@ The Windows installers aren't code-signed yet, so SmartScreen shows a warning. C
 - **Familiar editing.** Keyboard navigation (arrow keys, <kbd>⌘</kbd>+arrow, Tab/Enter, F2),
   copy and paste with other spreadsheet apps, column resizing and auto-fit, multiple sheets,
   and full undo/redo.
+- **Right-click menu.** Cut, copy, paste and paste special (values only or formatting only),
+  insert and delete rows and columns, insert or delete cells and shift the rest, clear
+  contents, and merge or unmerge cells. Drag the edge of a selection to move its cells.
 - **Selection stats.** Sum, average and count of the selected range.
 - **AI tools over MCP.** Connect almost any MCP client. See below.
 

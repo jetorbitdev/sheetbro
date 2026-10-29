@@ -87,6 +87,40 @@ export const PlusIcon = () => (
   </Svg>
 );
 
+export const CutIcon = () => (
+  <Svg>
+    <circle cx="4.5" cy="11.8" r="1.9" />
+    <circle cx="11.5" cy="11.8" r="1.9" />
+    <path d="M5.5 10.2 11 2.5M10.5 10.2 5 2.5" />
+  </Svg>
+);
+
+export const CopyIcon = () => (
+  <Svg>
+    <rect x="5.5" y="5.5" width="8" height="8" rx="1.6" />
+    <path d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5" />
+  </Svg>
+);
+
+export const PasteIcon = () => (
+  <Svg>
+    <rect x="3" y="3" width="10" height="10.5" rx="1.6" />
+    <path d="M6 3v-.5a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 .5.5V3M5.5 7.5h5M5.5 10.2h3" />
+  </Svg>
+);
+
+export const TrashIcon = () => (
+  <Svg>
+    <path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.2a1 1 0 0 0 1 .8h3.8a1 1 0 0 0 1-.8l.6-8.2M7 7v3.5M9 7v3.5" />
+  </Svg>
+);
+
+export const ClearIcon = () => (
+  <Svg>
+    <path d="m4.5 4.5 7 7M11.5 4.5l-7 7" />
+  </Svg>
+);
+
 // four-point sparkle: the "AI" star, sitting in the top-right corner of the 16px grid
 const SPARKLE = "M12.6.9l.72 1.98 1.98.72-1.98.72-.72 1.98-.72-1.98-1.98-.72 1.98-.72z";
 

@@ -6,14 +6,18 @@ import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   ActiveStyle,
   api,
+  Axis,
   cellName,
+  columnName,
   FormulaPreview,
   Layout,
   McpStatus,
   MergeMode,
   parseCellName,
+  Pull,
   RangeStats,
   Rect,
+  Shift,
   WorkbookChange,
   WorkbookInfo,
 } from "./api";
@@ -23,16 +27,22 @@ import {
   AlignLeftIcon,
   AlignRightIcon,
   AppMark,
+  ClearIcon,
+  CopyIcon,
+  CutIcon,
   FillColorIcon,
   McpIcon,
   MergeIcon,
   NoFillIcon,
+  PasteIcon,
   PlusIcon,
   RedoIcon,
   TextColorIcon,
+  TrashIcon,
   UndoIcon,
 } from "./Icons";
 import { anchorOf, expandRect } from "./merges";
+import { ContextMenu, MenuEntry, MenuItem } from "./ContextMenu";
 import { FunctionMenu } from "./FunctionMenu";
 import { McpPanel } from "./McpPanel";
 import { FormulaMirror } from "./FormulaMirror";
@@ -48,6 +58,9 @@ const EMPTY_LAYOUT: Layout = {
   row_heights: [],
 };
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+/** "Ctrl+" on Windows and Linux */
+const MOD = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl+";
+type PasteMode = "all" | "values" | "formats";
 const errText = (e: unknown) => (typeof e === "string" ? e : (e as Error)?.message ?? String(e));
 
 export function App() {
@@ -65,7 +78,8 @@ export function App() {
   const [blank, setBlank] = useState(true);
   const [dropping, setDropping] = useState(false);
   const [nameDraft, setNameDraft] = useState<string | null>(null);
-  const clipboard = useRef<{ text: string; raw: string[][] } | null>(null);
+  const clipboard = useRef<{ text: string; raw: string[][]; values: string[][] } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ left: number; top: number; ownClip: boolean } | null>(null);
   const [fnMenu, setFnMenu] = useState<{ left: number; top: number } | null>(null);
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
@@ -458,12 +472,14 @@ export function App() {
   // ------------------------------------------------------------- clipboard
   const copy = async (cut: boolean) => {
     try {
-      const [vals, raw] = await Promise.all([
+      const [vals, raw, values] = await Promise.all([
         api.getRangeText(sheet, rect, false),
         api.getRangeText(sheet, rect, true),
+        api.getRangeValues(sheet, rect),
+        api.copyFormats(sheet, rect),
       ]);
       const text = toTsv(vals);
-      clipboard.current = { text, raw };
+      clipboard.current = { text, raw, values };
       await writeText(text);
       if (cut) await mutate(api.clearRange(sheet, rect));
     } catch (e) {
@@ -471,13 +487,19 @@ export function App() {
     }
   };
 
-  const paste = async () => {
+  /** `values` leaves out formulas and number formats, `formats` pastes only the formatting. */
+  const paste = async (mode: PasteMode = "all") => {
     try {
       const text = await readText();
       if (!text) return;
       // Our own clipboard keeps formulas; foreign text is plain values.
       const own = clipboard.current?.text === text;
-      let values = own ? clipboard.current!.raw : parseTsv(text);
+      if (mode === "formats") {
+        if (!own) return setToast("Only cells copied in SheetBro carry formatting");
+        return await mutate(api.pasteFormats(sheet, rect));
+      }
+      const mine = mode === "values" ? clipboard.current?.values : clipboard.current?.raw;
+      let values = own ? mine! : parseTsv(text);
       let { row, col } = rect;
       let h = values.length;
       let w = Math.max(...values.map((r) => r.length));
@@ -499,6 +521,40 @@ export function App() {
   };
 
   const clearSelection = () => mutate(api.clearRange(sheet, rect));
+
+  // ------------------------------------------------------- rows and columns
+  /** Inserts as many rows or columns as are selected, before the selection. */
+  const insertLines = (axis: Axis) =>
+    axis === "rows"
+      ? mutate(api.insertLines(sheet, axis, rect.row, rect.height))
+      : mutate(api.insertLines(sheet, axis, rect.col, rect.width));
+
+  /** Inserts empty cells over the selection, pushing the cells after it down or to the right. */
+  const insertCells = (shift: Shift) => mutate(api.insertCells(sheet, rect, shift));
+
+  /** Deletes the cells of the selection, pulling the cells after it up or to the left. */
+  const deleteCells = (pull: Pull) => mutate(api.deleteCells(sheet, rect, pull));
+
+  /** Moves cells that were dragged to a new place, and selects them there. */
+  const moveCells = async (from: Rect, row: number, col: number) => {
+    try {
+      applyInfo(await api.moveCells(sheet, from, row, col));
+      setSel({ ar: row, ac: col, fr: row + from.height - 1, fc: col + from.width - 1 });
+    } catch (e) {
+      showError(e);
+    }
+  };
+
+  /** Deletes the selected rows or columns. Past the data there is nothing to delete. */
+  const deleteLines = (axis: Axis) => {
+    const used = info?.sheets[sheet];
+    const [at, size, last] =
+      axis === "rows"
+        ? [rect.row, rect.height, used?.rows ?? 1]
+        : [rect.col, rect.width, used?.cols ?? 1];
+    const count = Math.min(size, last - at + 1);
+    if (count > 0) void mutate(api.deleteLines(sheet, axis, at, count));
+  };
 
   // ---------------------------------------------------------------- styling
   const applyStyle = (path: string, value: string) =>
@@ -561,6 +617,108 @@ export function App() {
     } catch (e) {
       showError(e);
     }
+  };
+
+  // ----------------------------------------------------------- context menu
+  const closeCtxMenu = useCallback(() => setCtxMenu(null), []);
+
+  const openContextMenu = async (at: { left: number; top: number }) => {
+    // formatting can only be pasted while the cells we copied are still on the clipboard
+    const text = await readText().catch(() => "");
+    setCtxMenu({ ...at, ownClip: !!text && clipboard.current?.text === text });
+  };
+
+  const contextMenuItems = (ownClip: boolean): MenuEntry[] => {
+    // a whole column (or row) is selected: only columns (or rows) make sense to insert or delete
+    const wholeCols = rect.row === 1 && rect.height === rows;
+    const wholeRows = rect.col === 1 && rect.width === cols;
+    const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+    const lastRow = rect.row + rect.height - 1;
+    const lastCol = rect.col + rect.width - 1;
+    const groups: MenuItem[][] = [
+      [
+        { label: "Cut", icon: <CutIcon />, hint: `${MOD}X`, onPick: () => void copy(true) },
+        { label: "Copy", icon: <CopyIcon />, hint: `${MOD}C`, onPick: () => void copy(false) },
+        { label: "Paste", icon: <PasteIcon />, hint: `${MOD}V`, onPick: () => void paste() },
+        {
+          label: "Paste special",
+          icon: <PasteIcon />,
+          submenu: [
+            { label: "Values only", onPick: () => void paste("values") },
+            { label: "Formatting only", disabled: !ownClip, onPick: () => void paste("formats") },
+          ],
+        },
+      ],
+      [
+        ...(wholeCols
+          ? []
+          : [{
+              label: `Insert ${plural(rect.height, "row")} above`,
+              icon: <PlusIcon />,
+              onPick: () => void insertLines("rows"),
+            }]),
+        ...(wholeRows
+          ? []
+          : [{
+              label: `Insert ${plural(rect.width, "column")} to the left`,
+              icon: <PlusIcon />,
+              onPick: () => void insertLines("columns"),
+            }]),
+        ...(wholeCols || wholeRows
+          ? []
+          : [{
+              label: "Insert cells",
+              icon: <PlusIcon />,
+              submenu: [
+                { label: "Insert cells and shift right", onPick: () => void insertCells("right") },
+                { label: "Insert cells and shift down", onPick: () => void insertCells("down") },
+              ],
+            }]),
+      ],
+      [
+        ...(wholeCols
+          ? []
+          : [{
+              label: rect.height === 1 ? "Delete row" : `Delete rows ${rect.row} - ${lastRow}`,
+              icon: <TrashIcon />,
+              onPick: () => deleteLines("rows"),
+            }]),
+        ...(wholeRows
+          ? []
+          : [{
+              label:
+                rect.width === 1
+                  ? "Delete column"
+                  : `Delete columns ${columnName(rect.col)} - ${columnName(lastCol)}`,
+              icon: <TrashIcon />,
+              onPick: () => deleteLines("columns"),
+            }]),
+        ...(wholeCols || wholeRows
+          ? []
+          : [{
+              label: "Delete cells",
+              icon: <TrashIcon />,
+              submenu: [
+                { label: "Delete cells and shift left", onPick: () => void deleteCells("left") },
+                { label: "Delete cells and shift up", onPick: () => void deleteCells("up") },
+              ],
+            }]),
+      ],
+      [
+        { label: "Clear contents", icon: <ClearIcon />, hint: "Del", onPick: () => void clearSelection() },
+        ...(wholeCols || wholeRows
+          ? []
+          : [touchesMerge
+              ? { label: "Unmerge cells", icon: <MergeIcon />, onPick: () => void unmerge() }
+              : {
+                  label: "Merge cells",
+                  icon: <MergeIcon />,
+                  disabled: rect.width * rect.height < 2,
+                  onPick: () => void doMerge("merge"),
+                }]),
+      ],
+    ];
+    return groups.filter((g) => g.length).flatMap((g, i) => (i ? ["divider" as const, ...g] : g));
   };
 
   // -------------------------------------------------------------- shortcuts
@@ -825,6 +983,7 @@ export function App() {
           {mcp?.running && <i className="mcp-dot" />}
         </button>
       </div>
+      {ctxMenu && <ContextMenu at={ctxMenu} items={contextMenuItems(ctxMenu.ownClip)} onClose={closeCtxMenu} />}
       {fnMenu && <FunctionMenu anchor={fnMenu} onPick={pickFunction} onClose={() => setFnMenu(null)} />}
       {mcpOpen && mcp && (
         <McpPanel
@@ -918,6 +1077,8 @@ export function App() {
           pointFocus={pointFocus}
           refs={refs}
           preview={preview}
+          onContextMenu={(at) => void openContextMenu(at)}
+          onMoveCells={(from, row, col) => void moveCells(from, row, col)}
         />
         {blank && !info?.dirty && !editing && (
           <div className="empty-hint">

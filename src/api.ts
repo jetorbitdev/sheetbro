@@ -68,6 +68,14 @@ export interface Rect {
 
 export type MergeMode = "merge" | "center" | "across" | "down";
 
+export type Axis = "rows" | "columns";
+
+/** which way the cells at and after an insertion point move */
+export type Shift = "down" | "right";
+
+/** which way the cells after deleted ones move */
+export type Pull = "up" | "left";
+
 /** What a formula being typed would show, before it is entered */
 export interface FormulaPreview {
   text: string;
@@ -124,6 +132,25 @@ export const api = {
     invoke<WorkbookInfo>("merge_cells", { sheet, ...rectArgs(r), mode, discard }),
   unmergeCells: (sheet: number, r: Rect) =>
     invoke<WorkbookInfo>("unmerge_cells", { sheet, ...rectArgs(r) }),
+  /** `at` is the 1-based row or column the new ones go before */
+  insertLines: (sheet: number, axis: Axis, at: number, count: number) =>
+    invoke<WorkbookInfo>("insert_lines", { sheet, axis, at, count }),
+  deleteLines: (sheet: number, axis: Axis, at: number, count: number) =>
+    invoke<WorkbookInfo>("delete_lines", { sheet, axis, at, count }),
+  /** inserts empty cells over the range and pushes the cells after it down or to the right */
+  insertCells: (sheet: number, r: Rect, shift: Shift) =>
+    invoke<WorkbookInfo>("insert_cells", { sheet, ...rectArgs(r), shift }),
+  /** deletes the cells of the range and pulls the cells after it up or to the left */
+  deleteCells: (sheet: number, r: Rect, pull: Pull) =>
+    invoke<WorkbookInfo>("delete_cells", { sheet, ...rectArgs(r), pull }),
+  /** moves the cells of the range, with their formatting, so that its top-left corner is at (row, col) */
+  moveCells: (sheet: number, r: Rect, row: number, col: number) =>
+    invoke<WorkbookInfo>("move_cells", { sheet, ...rectArgs(r), toRow: row, toCol: col }),
+  /** remembers the formatting of the range for `pasteFormats` */
+  copyFormats: (sheet: number, r: Rect) =>
+    invoke<void>("copy_formats", { sheet, ...rectArgs(r) }),
+  pasteFormats: (sheet: number, r: Rect) =>
+    invoke<WorkbookInfo>("paste_formats", { sheet, ...rectArgs(r) }),
   autosumRange: (sheet: number, row: number, col: number) =>
     invoke<Rect | null>("autosum_range", { sheet, row, col }),
   previewFormula: (sheet: number, row: number, col: number, formula: string) =>
@@ -132,6 +159,9 @@ export const api = {
     invoke<ActiveStyle>("get_active_style", { sheet, row, col }),
   getRangeText: (sheet: number, r: Rect, raw: boolean) =>
     invoke<string[][]>("get_range_text", { sheet, ...rectArgs(r), raw }),
+  /** computed values only: no formulas, no number formats */
+  getRangeValues: (sheet: number, r: Rect) =>
+    invoke<string[][]>("get_range_values", { sheet, ...rectArgs(r) }),
   rangeStats: (sheet: number, r: Rect) =>
     invoke<RangeStats>("range_stats", { sheet, ...rectArgs(r) }),
   undo: () => invoke<WorkbookInfo>("undo"),

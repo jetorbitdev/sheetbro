@@ -15,9 +15,13 @@ use std::{
 use ironcalc::{
     base::{
         cell::CellValue,
-        expressions::types::Area,
-        types::{CellType, Color, HorizontalAlignment},
-        Model, UserModel,
+        expressions::{
+            parser::{stringify::to_english_string, Node},
+            token::Error,
+            types::{Area, CellReferenceRC},
+        },
+        types::{CellType, Color, HorizontalAlignment, Style},
+        ClipboardData, Model, UserModel,
     },
     export::save_xlsx_to_writer,
     import::load_from_xlsx,
@@ -29,6 +33,8 @@ use tauri::{
 };
 use tauri_plugin_dialog::DialogExt;
 
+const MAX_ROW: i32 = 1_048_576;
+const MAX_COL: i32 = 16_384;
 const LOCALE: &str = "en";
 const TZ: &str = "UTC";
 const LANG: &str = "en";
@@ -46,6 +52,8 @@ struct Doc {
     generation: u64,
     /// The empty workbook a window starts with, not a file that was opened
     blank: bool,
+    /// Formatting of the last copied range, for "paste formatting only"
+    format_clip: Vec<Vec<Style>>,
 }
 
 static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -64,6 +72,7 @@ impl Doc {
             redo_groups: Vec::new(),
             generation: next_generation(),
             blank: false,
+            format_clip: Vec::new(),
         }
     }
 
@@ -703,6 +712,562 @@ fn unmerge_cells(
     Ok(info(&doc))
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Axis {
+    Rows,
+    Columns,
+}
+
+/// Inserts `count` empty rows or columns before `at`, pushing the cells after them down or right.
+#[tauri::command]
+fn insert_lines(
+    sheet: u32,
+    axis: Axis,
+    at: i32,
+    count: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
+    match axis {
+        Axis::Rows => doc.model.insert_rows(sheet, at, count)?,
+        Axis::Columns => doc.model.insert_columns(sheet, at, count)?,
+    }
+    doc.record(1);
+    Ok(info(&doc))
+}
+
+fn remove_lines(
+    model: &mut UserModel,
+    sheet: u32,
+    axis: Axis,
+    at: i32,
+    count: i32,
+) -> CmdResult<()> {
+    match axis {
+        Axis::Rows => model.delete_rows(sheet, at, count),
+        Axis::Columns => model.delete_columns(sheet, at, count),
+    }
+}
+
+/// Every formula of the workbook as (sheet, row, column, text).
+fn all_formulas(model: &UserModel) -> CmdResult<Vec<(u32, i32, i32, String)>> {
+    let mut out = Vec::new();
+    for (i, sheet) in model.get_model().workbook.worksheets.iter().enumerate() {
+        for row in sheet.sheet_data.rows() {
+            for (col, cell) in sheet.sheet_data.cells_in_row(row) {
+                if cell.has_formula() {
+                    let text = model.get_cell_content(i as u32, row, col)?;
+                    out.push((i as u32, row, col, text));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Deletes rows or columns as one undo step.
+///
+/// IronCalc rewrites the formulas that pointed into the deleted cells (to #REF!, or to a
+/// shorter range) and its undo brings the cells back but not those formulas. So a delete is
+/// tried on a copy first; every formula that the copy does not get back is entered again
+/// unchanged before the real delete, and undoing that edit restores its text.
+fn delete_lines_in(doc: &mut Doc, sheet: u32, axis: Axis, at: i32, count: i32) -> CmdResult<()> {
+    let before = all_formulas(&doc.model)?;
+    // no formula can lose its references, so there is nothing to put back on undo
+    if before.is_empty() {
+        remove_lines(&mut doc.model, sheet, axis, at, count)?;
+        doc.record(1);
+        return Ok(());
+    }
+    let mut copy = UserModel::from_bytes(&doc.model.to_bytes(), LANG)?;
+    remove_lines(&mut copy, sheet, axis, at, count)?;
+    copy.undo()?;
+    let mut entries = 0;
+    let result = (|| {
+        doc.model.pause_evaluation();
+        for (s, r, c, text) in &before {
+            if copy.get_cell_content(*s, *r, *c)? != *text {
+                if let Err(e) = doc.model.set_user_input(*s, *r, *c, text) {
+                    doc.model.resume_evaluation();
+                    return Err(e);
+                }
+                entries += 1;
+            }
+        }
+        doc.model.resume_evaluation();
+        remove_lines(&mut doc.model, sheet, axis, at, count)?;
+        entries += 1;
+        Ok(())
+    })();
+    doc.record(entries);
+    result
+}
+
+/// Deletes `count` rows or columns starting at `at`, pulling the cells after them up or left.
+#[tauri::command]
+fn delete_lines(
+    sheet: u32,
+    axis: Axis,
+    at: i32,
+    count: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
+    delete_lines_in(&mut doc, sheet, axis, at, count)?;
+    Ok(info(&doc))
+}
+
+/// Which way inserted cells push the cells after them: down a column, or right along a row.
+#[derive(Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Shift {
+    Down,
+    Right,
+}
+
+/// Which way the cells after deleted ones are pulled: up a column, or left along a row.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Pull {
+    Up,
+    Left,
+}
+
+/// Calls `f` on every node of a formula, parents first.
+fn visit(node: &mut Node, f: &mut impl FnMut(&mut Node)) {
+    f(node);
+    match node {
+        Node::ImplicitIntersection { child, .. } | Node::SpillRangeOperator { child } => visit(child, f),
+        Node::UnaryKind { right, .. } => visit(right, f),
+        Node::OpRangeKind { left, right }
+        | Node::OpConcatenateKind { left, right }
+        | Node::OpSumKind { left, right, .. }
+        | Node::OpProductKind { left, right, .. }
+        | Node::OpPowerKind { left, right }
+        | Node::CompareKind { left, right, .. } => {
+            visit(left, f);
+            visit(right, f);
+        }
+        Node::FunctionKind { args, .. } | Node::NamedFunctionKind { args, .. } => {
+            args.iter_mut().for_each(|a| visit(a, f));
+        }
+        Node::LambdaDefKind { body, .. } => visit(body, f),
+        Node::LambdaCallKind { lambda, args } => {
+            visit(lambda, f);
+            args.iter_mut().for_each(|a| visit(a, f));
+        }
+        _ => {}
+    }
+}
+
+/// Rewrites every formula of the workbook for which `change` alters a node of the formula in
+/// cell (row, column). Returns how many were typed in again.
+fn rewrite_formulas(
+    doc: &mut Doc,
+    mut change: impl FnMut(&mut Node, (i32, i32)) -> bool,
+) -> CmdResult<usize> {
+    let model = doc.model.get_model();
+    let mut updates = Vec::new();
+    for (i, sheet) in model.workbook.worksheets.iter().enumerate() {
+        for row in sheet.sheet_data.rows() {
+            for (col, cell) in sheet.sheet_data.cells_in_row(row) {
+                let Some(f) = cell.get_formula() else { continue };
+                let Some((node, _)) = model.parsed_formulas.get(i).and_then(|p| p.get(f as usize))
+                else {
+                    continue;
+                };
+                let mut node = Node::clone(node);
+                let mut changed = false;
+                visit(&mut node, &mut |n| changed |= change(n, (row, col)));
+                if changed {
+                    let at = CellReferenceRC { sheet: sheet.get_name(), row, column: col };
+                    updates.push((i as u32, row, col, format!("={}", to_english_string(&node, &at))));
+                }
+            }
+        }
+    }
+    for (sheet, row, col, text) in &updates {
+        doc.model.set_user_input(*sheet, *row, *col, text)?;
+    }
+    Ok(updates.len())
+}
+
+/// The cells a reference or range node points at, as absolute (row1, col1, row2, col2).
+/// References are stored relative to the cell of the formula unless they are absolute.
+fn reference_cells(node: &Node, cell: (i32, i32)) -> Option<(u32, [i32; 4])> {
+    let at = |absolute: bool, v: i32, base: i32| if absolute { v } else { v + base };
+    match node {
+        Node::ReferenceKind { sheet_index, absolute_row, absolute_column, row, column, .. } => {
+            let (r, c) = (at(*absolute_row, *row, cell.0), at(*absolute_column, *column, cell.1));
+            Some((*sheet_index, [r, c, r, c]))
+        }
+        Node::RangeKind {
+            sheet_index,
+            absolute_row1,
+            absolute_column1,
+            row1,
+            column1,
+            absolute_row2,
+            absolute_column2,
+            row2,
+            column2,
+            ..
+        } => Some((
+            *sheet_index,
+            [
+                at(*absolute_row1, *row1, cell.0),
+                at(*absolute_column1, *column1, cell.1),
+                at(*absolute_row2, *row2, cell.0),
+                at(*absolute_column2, *column2, cell.1),
+            ],
+        )),
+        _ => None,
+    }
+}
+
+/// Moves one end of a range node. `end` is 1 or 2; `by` applies to the row or the column.
+/// An absolute reference holds the cell itself and a relative one the distance to the formula's
+/// cell, so the same amount is added either way.
+fn nudge_end(node: &mut Node, end: u8, vertical: bool, by: i32) {
+    if let Node::RangeKind { row1, column1, row2, column2, .. } = node {
+        match (end, vertical) {
+            (1, true) => *row1 += by,
+            (1, false) => *column1 += by,
+            (_, true) => *row2 += by,
+            (_, false) => *column2 += by,
+        }
+    }
+}
+
+/// Where cells were pushed aside: ranges that start before it and end at or after it must grow.
+struct Cut {
+    sheet: u32,
+    /// the first row (shifting down) or column (shifting right) that moved
+    at: i32,
+    /// the columns (shifting down) or rows (shifting right) that shifted
+    span: (i32, i32),
+    shift: Shift,
+    by: i32,
+}
+
+/// Grows a range the insertion cut through. The cut and paste IronCalc does moves only the
+/// references that sit wholly inside the moved cells, so `SUM(A1:A4)` stays as it is when a
+/// cell is inserted in the middle of A1:A4.
+fn grow_cut_range(node: &mut Node, cell: (i32, i32), cut: &Cut) -> bool {
+    let Some((sheet, [r1, c1, r2, c2])) = reference_cells(node, cell) else { return false };
+    if sheet != cut.sheet || !matches!(node, Node::RangeKind { .. }) {
+        return false;
+    }
+    let vertical = cut.shift == Shift::Down;
+    // along: the axis that moved; across: the one that did not
+    let (along, across) = if vertical { ((r1, r2), (c1, c2)) } else { ((c1, c2), (r1, r2)) };
+    let cuts = along.0.min(along.1) < cut.at
+        && along.0.max(along.1) >= cut.at
+        && across.0.min(across.1) >= cut.span.0
+        && across.0.max(across.1) <= cut.span.1;
+    if cuts {
+        // the far end moves, whichever way the range was written
+        nudge_end(node, if along.0 >= along.1 { 1 } else { 2 }, vertical, cut.by);
+    }
+    cuts
+}
+
+/// Cells that are about to be deleted.
+struct Gone {
+    sheet: u32,
+    /// the first deleted row (pulling up) or column (pulling left)
+    from: i32,
+    count: i32,
+    /// the columns (pulling up) or rows (pulling left) that are deleted from
+    span: (i32, i32),
+    pull: Pull,
+}
+
+/// What deleting cells does to a reference: one that points at them turns into #REF!, and a
+/// range that reaches into them is cut short. The cells after them are moved by the cut and
+/// paste, which also moves the references that point at those.
+fn drop_gone_refs(node: &mut Node, cell: (i32, i32), gone: &Gone) -> bool {
+    let Some((sheet, [r1, c1, r2, c2])) = reference_cells(node, cell) else { return false };
+    if sheet != gone.sheet {
+        return false;
+    }
+    let vertical = matches!(gone.pull, Pull::Up);
+    let (along, across) = if vertical { ((r1, r2), (c1, c2)) } else { ((c1, c2), (r1, r2)) };
+    let (lo, hi) = (along.0.min(along.1), along.0.max(along.1));
+    let (first, last) = (gone.from, gone.from + gone.count - 1);
+    if across.0.min(across.1) < gone.span.0 || across.0.max(across.1) > gone.span.1 || hi < first || lo > last {
+        return false;
+    }
+    if lo >= first && hi <= last {
+        *node = Node::ErrorKind(Error::REF);
+        return true;
+    }
+    // the near end falls on the first cell after the deleted ones, the far end follows its cell
+    let new_lo = if lo >= first { first } else { lo };
+    let new_hi = if hi <= last { first - 1 } else { hi - gone.count };
+    let (near, far) = if along.0 <= along.1 { (1, 2) } else { (2, 1) };
+    nudge_end(node, near, vertical, new_lo - lo);
+    nudge_end(node, far, vertical, new_hi - hi);
+    true
+}
+
+/// Cuts the cells of `from` (first row, first column, last row, last column) and pastes them
+/// with their top-left corner at `to`. IronCalc moves their content, formatting, links and merges,
+/// and rewrites the formulas that point at them. One history entry.
+fn cut_and_paste(
+    doc: &mut Doc,
+    sheet: u32,
+    from: (i32, i32, i32, i32),
+    to: (i32, i32),
+) -> CmdResult<()> {
+    doc.model.set_selected_sheet(sheet)?;
+    doc.model.set_selected_cell(from.0, from.1)?;
+    doc.model.set_selected_range(from.0, from.1, from.2, from.3)?;
+    let clip = doc.model.copy_to_clipboard()?;
+    // the clipboard type is not exported, but its cells are
+    let data: ClipboardData = serde_json::from_value(
+        serde_json::to_value(&clip).map_err(|e| e.to_string())?["data"].take(),
+    )
+    .map_err(|e| e.to_string())?;
+    doc.model.set_selected_cell(to.0, to.1)?;
+    doc.model.paste_from_clipboard(sheet, from, &data, true)
+}
+
+/// Refuses to touch cells where merged cells would be cut in two.
+fn check_no_merges(doc: &Doc, sheet: u32, rows: (i32, i32), cols: (i32, i32)) -> CmdResult<()> {
+    let merged = doc.model.get_merged_cells(sheet)?;
+    let hit = merged.iter().any(|m| {
+        m.row <= rows.1 && m.row + m.height > rows.0 && m.column <= cols.1 && m.column + m.width > cols.0
+    });
+    if hit {
+        return Err("Cannot shift cells where cells are merged".to_string());
+    }
+    Ok(())
+}
+
+/// Inserts empty cells at `area`, shifting the cells below it (or to its right) out of the way.
+///
+/// IronCalc has no such operation, but a shift is a cut and paste of the cells from the
+/// insertion point to the edge of the data, one step over. Ranges the insertion cuts through
+/// are grown afterwards. All of it is one undo step.
+fn insert_cells_in(doc: &mut Doc, area: &Area, shift: Shift) -> CmdResult<()> {
+    let Area { sheet, row, column: col, width, height } = *area;
+    let dim = doc.model.get_model().workbook.worksheet(sheet)?.dimension();
+    let (last_row, last_col, to_row, to_col) = match shift {
+        Shift::Down => (dim.max_row, col + width - 1, row + height, col),
+        Shift::Right => (row + height - 1, dim.max_column, row, col + width),
+    };
+    // nothing at or past the insertion point: there is nothing to push away
+    if last_row < row || last_col < col {
+        return Ok(());
+    }
+    let (end_row, end_col) = match shift {
+        Shift::Down => (last_row + height, last_col),
+        Shift::Right => (last_row, last_col + width),
+    };
+    if end_row > MAX_ROW || end_col > MAX_COL {
+        return Err("Cannot shift the cells past the end of the sheet".to_string());
+    }
+    cut_and_paste(doc, sheet, (row, col, last_row, last_col), (to_row, to_col))?;
+    let cut = match shift {
+        Shift::Down => Cut { sheet, at: row, span: (col, col + width - 1), shift, by: height },
+        Shift::Right => Cut { sheet, at: col, span: (row, row + height - 1), shift, by: width },
+    };
+    let grown = rewrite_formulas(doc, |n, cell| grow_cut_range(n, cell, &cut));
+    // the paste is done even if a formula could not be rewritten
+    doc.record(1 + grown.as_ref().copied().unwrap_or(0));
+    grown.map(|_| ())
+}
+
+/// Deletes the cells of `area`, pulling the cells below it (or to its right) over them.
+///
+/// The formulas are rewritten first (see `drop_gone_refs`), then the cells after the deleted ones
+/// are cut and pasted over them. All of it is one undo step.
+fn delete_cells_in(doc: &mut Doc, area: &Area, pull: Pull) -> CmdResult<()> {
+    let Area { sheet, row, column: col, width, height } = *area;
+    let dim = doc.model.get_model().workbook.worksheet(sheet)?.dimension();
+    // (the deleted cells, the cells that come after them, as first/last row and column)
+    let (gone, tail, to, gone_span) = match pull {
+        Pull::Up => (
+            Gone { sheet, from: row, count: height, span: (col, col + width - 1), pull },
+            (row + height, col, dim.max_row, col + width - 1),
+            (row, col),
+            (row, row + height - 1, col, col + width - 1),
+        ),
+        Pull::Left => (
+            Gone { sheet, from: col, count: width, span: (row, row + height - 1), pull },
+            (row, col + width, row + height - 1, dim.max_column),
+            (row, col),
+            (row, row + height - 1, col, col + width - 1),
+        ),
+    };
+    // all the cells in the way are empty
+    if row > dim.max_row || col > dim.max_column {
+        return Ok(());
+    }
+    let reach_rows = (row, tail.2.max(gone_span.1));
+    let reach_cols = (col, tail.3.max(gone_span.3));
+    check_no_merges(doc, sheet, reach_rows, reach_cols)?;
+
+    let mut entries = 0;
+    let result = (|| {
+        entries += rewrite_formulas(doc, |n, cell| drop_gone_refs(n, cell, &gone))?;
+        let has_tail = tail.2 >= tail.0 && tail.3 >= tail.1;
+        let covered = if has_tail {
+            cut_and_paste(doc, sheet, tail, to)?;
+            entries += 1;
+            // the pulled cells cover this many of the deleted ones
+            match pull {
+                Pull::Up => tail.2 - tail.0 + 1,
+                Pull::Left => tail.3 - tail.1 + 1,
+            }
+        } else {
+            0
+        };
+        // what the pulled cells did not cover is emptied, formatting and all
+        let rest = match pull {
+            Pull::Up => Area { row: row + covered, height: height - covered, ..*area },
+            Pull::Left => Area { column: col + covered, width: width - covered, ..*area },
+        };
+        if rest.height > 0 && rest.width > 0 {
+            doc.model.range_clear_all(&rest)?;
+            entries += 1;
+        }
+        Ok(())
+    })();
+    doc.record(entries);
+    result
+}
+
+/// Moves the cells of `area` so that their top-left corner lands on (to_row, to_col), over
+/// whatever is there. Blank space past the data is left where it is.
+fn move_cells_in(doc: &mut Doc, area: &Area, to_row: i32, to_col: i32) -> CmdResult<()> {
+    let Area { sheet, row, column: col, width, height } = *area;
+    if (to_row, to_col) == (row, col) {
+        return Ok(());
+    }
+    if to_row < 1 || to_col < 1 || to_row + height - 1 > MAX_ROW || to_col + width - 1 > MAX_COL {
+        return Err("Cannot move the cells off the sheet".to_string());
+    }
+    let dim = doc.model.get_model().workbook.worksheet(sheet)?.dimension();
+    let last_row = (row + height - 1).min(dim.max_row);
+    let last_col = (col + width - 1).min(dim.max_column);
+    if last_row < row || last_col < col {
+        return Ok(());
+    }
+    cut_and_paste(doc, sheet, (row, col, last_row, last_col), (to_row, to_col))?;
+    doc.record(1);
+    Ok(())
+}
+
+/// Inserts empty cells at the range, shifting the cells below it or to its right.
+#[tauri::command]
+fn insert_cells(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    height: i32,
+    width: i32,
+    shift: Shift,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
+    insert_cells_in(&mut doc, &Area { sheet, row, column: col, width, height }, shift)?;
+    Ok(info(&doc))
+}
+
+/// Deletes the cells of the range, pulling the cells below it or to its right over them.
+#[tauri::command]
+fn delete_cells(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    height: i32,
+    width: i32,
+    pull: Pull,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
+    delete_cells_in(&mut doc, &Area { sheet, row, column: col, width, height }, pull)?;
+    Ok(info(&doc))
+}
+
+/// Moves the cells of the range, with their formatting, to a new top-left corner.
+#[tauri::command]
+fn move_cells(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    height: i32,
+    width: i32,
+    to_row: i32,
+    to_col: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
+    move_cells_in(&mut doc, &Area { sheet, row, column: col, width, height }, to_row, to_col)?;
+    Ok(info(&doc))
+}
+
+/// Remembers the formatting of a range for `paste_formats`.
+#[tauri::command]
+fn copy_formats(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    height: i32,
+    width: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<()> {
+    let mut doc = state.doc(window.label());
+    let styles = read_range(&doc, sheet, row, col, height, width, |r, c| {
+        doc.model.get_cell_style(sheet, r, c)
+    })?;
+    doc.format_clip = styles;
+    Ok(())
+}
+
+/// Largest selection that is filled cell by cell, as in a plain paste.
+const MAX_FILL_CELLS: i64 = 10_000;
+
+/// Applies the formatting remembered by `copy_formats` to the range, repeating it to fill the range.
+#[tauri::command]
+fn paste_formats(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    height: i32,
+    width: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<WorkbookInfo> {
+    let mut doc = state.doc(window.label());
+    let styles = doc.format_clip.clone();
+    let Some(first) = styles.first() else {
+        return Err("Copy some cells first".to_string());
+    };
+    let (clip_h, clip_w) = (styles.len() as i32, first.len() as i32);
+    // a huge selection (a whole column, say) only gets one copy of the formatting
+    let (h, w) = if i64::from(height) * i64::from(width) <= MAX_FILL_CELLS {
+        (height.max(clip_h), width.max(clip_w))
+    } else {
+        (clip_h, clip_w)
+    };
+    doc.model.set_selected_sheet(sheet)?;
+    doc.model.set_selected_cell(row, col)?;
+    doc.model.set_selected_range(row, col, row + h - 1, col + w - 1)?;
+    doc.model.on_paste_styles(&styles)?;
+    doc.record(1);
+    Ok(info(&doc))
+}
+
 /// Sets several column widths (pixels) as a single undo step.
 #[tauri::command]
 fn set_column_widths(
@@ -836,6 +1401,24 @@ fn get_active_style(
 }
 
 /// Text of a rectangular range; `raw` returns formulas instead of displayed values.
+/// Reads every cell of the range with `read`, leaving out the empty space past the data.
+fn read_range<T>(
+    doc: &Doc,
+    sheet: u32,
+    row: i32,
+    col: i32,
+    height: i32,
+    width: i32,
+    read: impl Fn(i32, i32) -> CmdResult<T>,
+) -> CmdResult<Vec<Vec<T>>> {
+    let dim = doc.model.get_model().workbook.worksheet(sheet)?.dimension();
+    let last_row = (row + height - 1).min(dim.max_row).max(row);
+    let last_col = (col + width - 1).min(dim.max_column).max(col);
+    (row..=last_row)
+        .map(|r| (col..=last_col).map(|c| read(r, c)).collect())
+        .collect()
+}
+
 #[tauri::command]
 fn get_range_text(
     sheet: u32,
@@ -848,23 +1431,36 @@ fn get_range_text(
     state: State<AppState>,
 ) -> CmdResult<Vec<Vec<String>>> {
     let doc = state.doc(window.label());
-    let dim = doc.model.get_model().workbook.worksheet(sheet)?.dimension();
-    // No point in copying the empty space past the data
-    let last_row = (row + height - 1).min(dim.max_row).max(row);
-    let last_col = (col + width - 1).min(dim.max_column).max(col);
-    (row..=last_row)
-        .map(|r| {
-            (col..=last_col)
-                .map(|c| {
-                    if raw {
-                        doc.model.get_cell_content(sheet, r, c)
-                    } else {
-                        doc.model.get_formatted_cell_value(sheet, r, c)
-                    }
-                })
-                .collect()
+    read_range(&doc, sheet, row, col, height, width, |r, c| {
+        if raw {
+            doc.model.get_cell_content(sheet, r, c)
+        } else {
+            doc.model.get_formatted_cell_value(sheet, r, c)
+        }
+    })
+}
+
+/// The values of a range, without formulas or number formats, as text a cell accepts.
+#[tauri::command]
+fn get_range_values(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    height: i32,
+    width: i32,
+    window: Window,
+    state: State<AppState>,
+) -> CmdResult<Vec<Vec<String>>> {
+    let doc = state.doc(window.label());
+    let model = doc.model.get_model();
+    read_range(&doc, sheet, row, col, height, width, |r, c| {
+        Ok(match model.get_cell_value_by_index(sheet, r, c)? {
+            CellValue::None => String::new(),
+            CellValue::String(s) => s,
+            CellValue::Number(n) => n.to_string(),
+            CellValue::Boolean(b) => b.to_string().to_uppercase(),
         })
-        .collect()
+    })
 }
 
 #[derive(Serialize, Default)]
@@ -1234,8 +1830,16 @@ pub fn run() {
             column_texts,
             merge_cells,
             unmerge_cells,
+            insert_lines,
+            delete_lines,
+            insert_cells,
+            delete_cells,
+            move_cells,
+            copy_formats,
+            paste_formats,
             get_active_style,
             get_range_text,
+            get_range_values,
             range_stats,
             undo,
             redo,
@@ -1498,5 +2102,243 @@ mod tests {
         assert_eq!((r.row, r.col, r.height, r.width), (6, 2, 1, 2));
         // nothing numeric next to Z9
         assert!(autosum_in(m, 0, 9, 26).is_none());
+    }
+    /// Fills A1:A3 with 1, 2, 3 and A4:A6 with formulas that read them.
+    fn doc_with_formulas() -> Doc {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for (r, v) in [(1, "1"), (2, "2"), (3, "3"), (4, "=A1+A2"), (5, "=SUM(A1:A3)"), (6, "=A4*2")] {
+            doc.model.set_user_input(0, r, 1, v).unwrap();
+        }
+        doc
+    }
+
+    #[test]
+    fn deleting_rows_undoes_with_the_formulas_that_pointed_into_them() {
+        let mut doc = doc_with_formulas();
+        let before = all_formulas(&doc.model).unwrap();
+
+        delete_lines_in(&mut doc, 0, Axis::Rows, 2, 2).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 2, 1).unwrap(), "=A1+#REF!");
+        assert_eq!(doc.model.get_cell_content(0, 4, 1).unwrap(), "=A2*2");
+        // however many formulas had to be put back, it is still one step
+        assert_eq!(doc.undo_groups.len(), 1);
+
+        doc.replay(false).unwrap();
+        assert_eq!(all_formulas(&doc.model).unwrap(), before);
+        assert_eq!(doc.model.get_cell_content(0, 3, 1).unwrap(), "3");
+
+        doc.replay(true).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 2, 1).unwrap(), "=A1+#REF!");
+        assert_eq!(doc.model.get_cell_content(0, 4, 1).unwrap(), "=A2*2");
+    }
+
+    #[test]
+    fn deleting_columns_undoes_with_the_formulas_that_pointed_into_them() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for (c, v) in [(1, "1"), (2, "2"), (3, "=A1+B1"), (4, "=SUM(A1:B1)")] {
+            doc.model.set_user_input(0, 1, c, v).unwrap();
+        }
+        let before = all_formulas(&doc.model).unwrap();
+        delete_lines_in(&mut doc, 0, Axis::Columns, 2, 1).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 1, 2).unwrap(), "=A1+#REF!");
+        doc.replay(false).unwrap();
+        assert_eq!(all_formulas(&doc.model).unwrap(), before);
+    }
+
+    #[test]
+    fn deleting_lines_without_formulas_is_one_undo_step() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for (r, v) in [(1, "a"), (2, "b"), (3, "c")] {
+            doc.model.set_user_input(0, r, 1, v).unwrap();
+        }
+        delete_lines_in(&mut doc, 0, Axis::Rows, 2, 1).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 2, 1).unwrap(), "c");
+        assert_eq!(doc.undo_groups, vec![1]);
+        doc.replay(false).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 2, 1).unwrap(), "b");
+        assert_eq!(doc.model.get_cell_content(0, 3, 1).unwrap(), "c");
+    }
+
+    #[test]
+    fn inserting_lines_is_one_undo_step() {
+        let mut doc = doc_with_formulas();
+        doc.model.insert_rows(0, 2, 3).unwrap();
+        doc.record(1);
+        // the formulas follow their cells
+        assert_eq!(doc.model.get_cell_content(0, 7, 1).unwrap(), "=A1+A5");
+        doc.replay(false).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 4, 1).unwrap(), "=A1+A2");
+    }
+    fn insert_area(row: i32, column: i32, height: i32, width: i32) -> Area {
+        Area { sheet: 0, row, column, width, height }
+    }
+
+    #[test]
+    fn inserting_cells_down_moves_the_data_and_grows_the_totals() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for r in 1..=4 {
+            doc.model.set_user_input(0, r, 1, &r.to_string()).unwrap();
+        }
+        doc.model.set_user_input(0, 5, 1, "=SUM(A1:A4)").unwrap(); // total below the data
+        doc.model.set_user_input(0, 1, 3, "=SUM(A1:A5)").unwrap(); // total in another column
+        doc.model.set_user_input(0, 2, 2, "=A2*10").unwrap(); // beside the data, not shifted
+        doc.model.evaluate();
+
+        insert_cells_in(&mut doc, &insert_area(3, 1, 1, 1), Shift::Down).unwrap();
+        let cell = |r, c| doc.model.get_cell_content(0, r, c).unwrap();
+        assert_eq!([cell(1, 1), cell(2, 1), cell(3, 1), cell(4, 1), cell(5, 1)], ["1", "2", "", "3", "4"]);
+        assert_eq!(cell(6, 1), "=SUM(A1:A5)");
+        assert_eq!(cell(1, 3), "=SUM(A1:A6)");
+        assert_eq!(cell(2, 2), "=A2*10", "a cell above the insertion does not move");
+        assert_eq!(doc.model.get_formatted_cell_value(0, 6, 1).unwrap(), "10");
+        // the other total adds up the data and the first total
+        assert_eq!(doc.model.get_formatted_cell_value(0, 1, 3).unwrap(), "20");
+
+        // all of it is one step
+        assert_eq!(doc.undo_groups.len(), 1);
+        doc.replay(false).unwrap();
+        let cell = |r, c| doc.model.get_cell_content(0, r, c).unwrap();
+        assert_eq!([cell(3, 1), cell(4, 1), cell(5, 1)], ["3", "4", "=SUM(A1:A4)"]);
+        assert_eq!(cell(1, 3), "=SUM(A1:A5)");
+        doc.replay(true).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 6, 1).unwrap(), "=SUM(A1:A5)");
+        assert_eq!(doc.model.get_cell_content(0, 1, 3).unwrap(), "=SUM(A1:A6)");
+    }
+
+    #[test]
+    fn inserting_cells_right_moves_the_row_and_follows_references() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for c in 1..=4 {
+            doc.model.set_user_input(0, 1, c, &c.to_string()).unwrap();
+        }
+        doc.model.set_user_input(0, 1, 5, "=SUM(A1:D1)").unwrap();
+        doc.model.set_user_input(0, 2, 1, "=A1+D1").unwrap();
+        doc.model.evaluate();
+
+        insert_cells_in(&mut doc, &insert_area(1, 2, 1, 2), Shift::Right).unwrap();
+        let cell = |r, c| doc.model.get_cell_content(0, r, c).unwrap();
+        assert_eq!([cell(1, 1), cell(1, 2), cell(1, 3), cell(1, 4), cell(1, 5), cell(1, 6)], ["1", "", "", "2", "3", "4"]);
+        assert_eq!(cell(1, 7), "=SUM(A1:F1)");
+        assert_eq!(cell(2, 1), "=A1+F1", "a single reference follows its cell");
+        assert_eq!(doc.undo_groups.len(), 1);
+    }
+
+    #[test]
+    fn inserting_cells_keeps_the_formatting_of_the_moved_cells() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        doc.model.set_user_input(0, 1, 1, "x").unwrap();
+        doc.model.set_user_input(0, 2, 1, "y").unwrap();
+        doc.model.update_range_style(&insert_area(2, 1, 1, 1), "font.b", "true").unwrap();
+        insert_cells_in(&mut doc, &insert_area(2, 1, 1, 1), Shift::Down).unwrap();
+        assert!(!doc.model.get_cell_style(0, 2, 1).unwrap().font.b, "the new cell is plain");
+        assert!(doc.model.get_cell_style(0, 3, 1).unwrap().font.b);
+        assert_eq!(doc.model.get_cell_content(0, 3, 1).unwrap(), "y");
+    }
+
+    #[test]
+    fn inserting_cells_past_the_data_changes_nothing() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        doc.model.set_user_input(0, 1, 1, "x").unwrap();
+        insert_cells_in(&mut doc, &insert_area(50, 1, 2, 1), Shift::Down).unwrap();
+        insert_cells_in(&mut doc, &insert_area(1, 9, 1, 2), Shift::Right).unwrap();
+        assert!(doc.undo_groups.is_empty());
+    }
+    #[test]
+    fn deleting_cells_pulls_the_rest_up_and_fixes_the_references() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for r in 1..=5 {
+            doc.model.set_user_input(0, r, 1, &r.to_string()).unwrap();
+        }
+        doc.model.set_user_input(0, 6, 1, "=SUM(A1:A5)").unwrap(); // total below the data
+        doc.model.set_user_input(0, 1, 2, "=A3+1").unwrap(); // points at the deleted cell
+        doc.model.set_user_input(0, 2, 2, "=A5*2").unwrap(); // points at a cell that moves
+        doc.model.set_user_input(0, 1, 3, "=SUM(A1:A6)").unwrap(); // range that reaches into it
+        doc.model.evaluate();
+
+        delete_cells_in(&mut doc, &insert_area(3, 1, 1, 1), Pull::Up).unwrap();
+        let cell = |r, c| doc.model.get_cell_content(0, r, c).unwrap();
+        assert_eq!([cell(1, 1), cell(2, 1), cell(3, 1), cell(4, 1), cell(5, 1), cell(6, 1)], ["1", "2", "4", "5", "=SUM(A1:A4)", ""]);
+        assert_eq!(cell(1, 2), "=#REF!+1");
+        assert_eq!(cell(2, 2), "=A4*2");
+        assert_eq!(cell(1, 3), "=SUM(A1:A5)");
+        assert_eq!(doc.model.get_formatted_cell_value(0, 5, 1).unwrap(), "12");
+        assert_eq!(doc.model.get_formatted_cell_value(0, 1, 3).unwrap(), "24");
+
+        assert_eq!(doc.undo_groups.len(), 1);
+        doc.replay(false).unwrap();
+        let cell = |r, c| doc.model.get_cell_content(0, r, c).unwrap();
+        assert_eq!([cell(3, 1), cell(5, 1), cell(6, 1)], ["3", "5", "=SUM(A1:A5)"]);
+        assert_eq!([cell(1, 2), cell(2, 2), cell(1, 3)], ["=A3+1", "=A5*2", "=SUM(A1:A6)"]);
+    }
+
+    #[test]
+    fn deleting_cells_pulls_the_rest_left() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for c in 1..=5 {
+            doc.model.set_user_input(0, 1, c, &c.to_string()).unwrap();
+        }
+        doc.model.set_user_input(0, 1, 6, "=SUM(A1:E1)").unwrap();
+        doc.model.set_user_input(0, 2, 1, "=B1+E1").unwrap();
+        doc.model.evaluate();
+
+        delete_cells_in(&mut doc, &insert_area(1, 2, 1, 2), Pull::Left).unwrap();
+        let cell = |r, c| doc.model.get_cell_content(0, r, c).unwrap();
+        assert_eq!([cell(1, 1), cell(1, 2), cell(1, 3), cell(1, 4)], ["1", "4", "5", "=SUM(A1:C1)"]);
+        assert_eq!(cell(1, 5), "");
+        assert_eq!(cell(2, 1), "=#REF!+C1");
+        assert_eq!(doc.undo_groups.len(), 1);
+    }
+
+    #[test]
+    fn deleting_cells_past_the_data_or_with_nothing_after_them() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        for r in 1..=3 {
+            doc.model.set_user_input(0, r, 1, &r.to_string()).unwrap();
+            doc.model.update_range_style(&insert_area(r, 1, 1, 1), "font.b", "true").unwrap();
+        }
+        // beyond the data: nothing happens
+        delete_cells_in(&mut doc, &insert_area(50, 1, 2, 1), Pull::Up).unwrap();
+        assert!(doc.undo_groups.is_empty());
+        // the last two cells: nothing comes up to replace them, formatting goes too
+        delete_cells_in(&mut doc, &insert_area(2, 1, 5, 1), Pull::Up).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 1, 1).unwrap(), "1");
+        assert_eq!(doc.model.get_cell_content(0, 2, 1).unwrap(), "");
+        assert!(!doc.model.get_cell_style(0, 3, 1).unwrap().font.b);
+        assert_eq!(doc.undo_groups.len(), 1);
+    }
+
+    #[test]
+    fn moving_cells_takes_their_formatting_and_the_references_along() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        doc.model.set_user_input(0, 1, 1, "10").unwrap();
+        doc.model.set_user_input(0, 2, 1, "20").unwrap();
+        doc.model.update_range_style(&insert_area(1, 1, 1, 1), "font.b", "true").unwrap();
+        doc.model.set_user_input(0, 1, 4, "=A1+A2").unwrap();
+        doc.model.set_user_input(0, 3, 3, "gone").unwrap(); // overwritten by the move
+        doc.model.evaluate();
+
+        move_cells_in(&mut doc, &insert_area(1, 1, 3, 1), 1, 3).unwrap();
+        let cell = |r, c| doc.model.get_cell_content(0, r, c).unwrap();
+        assert_eq!([cell(1, 1), cell(2, 1), cell(1, 3), cell(2, 3), cell(3, 3)], ["", "", "10", "20", ""]);
+        assert!(doc.model.get_cell_style(0, 1, 3).unwrap().font.b);
+        assert!(!doc.model.get_cell_style(0, 1, 1).unwrap().font.b);
+        assert_eq!(cell(1, 4), "=C1+C2");
+        assert_eq!(doc.model.get_formatted_cell_value(0, 1, 4).unwrap(), "30");
+
+        assert_eq!(doc.undo_groups.len(), 1);
+        doc.replay(false).unwrap();
+        assert_eq!(doc.model.get_cell_content(0, 1, 1).unwrap(), "10");
+        assert_eq!(doc.model.get_cell_content(0, 3, 3).unwrap(), "gone");
+        assert_eq!(doc.model.get_cell_content(0, 1, 4).unwrap(), "=A1+A2");
+    }
+
+    #[test]
+    fn moving_cells_off_the_sheet_or_nowhere() {
+        let mut doc = Doc::new(new_model("t").unwrap(), None);
+        doc.model.set_user_input(0, 1, 1, "x").unwrap();
+        assert!(move_cells_in(&mut doc, &insert_area(1, 1, 2, 1), 0, 1).is_err());
+        assert!(move_cells_in(&mut doc, &insert_area(1, 1, 2, 1), MAX_ROW, 1).is_err());
+        move_cells_in(&mut doc, &insert_area(1, 1, 1, 1), 1, 1).unwrap();
+        assert!(doc.undo_groups.is_empty());
     }
 }

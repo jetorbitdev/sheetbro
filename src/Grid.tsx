@@ -39,6 +39,9 @@ export const SANS = '"IBM Plex Sans", -apple-system, sans-serif';
 export const MONO = '"IBM Plex Mono", ui-monospace, monospace';
 /** how close (px) to a column border the pointer must be to grab it */
 const RESIZE_SLOP = 4;
+/** how far (px) outside and inside the selection's edge the pointer still grabs it to move the cells */
+const GRAB_OUT = 2;
+const GRAB_IN = 4;
 const MIN_COL_W = 24;
 const MAX_COL_W = 2000;
 
@@ -71,6 +74,10 @@ interface Props {
   refs: FormulaRef[];
   /** what the formula being edited would show */
   preview: FormulaPreview | null;
+  /** right-click: the selection already covers what was clicked; `at` is the pointer in viewport pixels */
+  onContextMenu: (at: { left: number; top: number }) => void;
+  /** the selection was dragged by its edge: `from` now goes with its top-left corner at (row, col) */
+  onMoveCells: (from: Rect, row: number, col: number) => void;
 }
 
 /** First index i in [0, n) with prefix[i + 1] > v, i.e. the item containing offset v. */
@@ -105,12 +112,20 @@ export function Grid(p: Props) {
     cells: Map<number, CellData>;
   } | null>(null);
   const fetchSeq = useRef(0);
-  const dragging = useRef<null | "cells" | "cols" | "rows" | "resize" | "point">(null);
+  const dragging = useRef<null | "cells" | "cols" | "rows" | "resize" | "point" | "move">(null);
   const pointAnchor = useRef({ row: 1, col: 1 });
   // live width while dragging a column border; cleared once the new layout arrives
   const [resize, setResize] = useState<{ col: number; width: number } | null>(null);
   const resizeStart = useRef({ col: 0, x: 0, width: 0 });
   const [hoverBorder, setHoverBorder] = useState<number | null>(null);
+  // the selection's edge is under the pointer (a hand), or the cells are being carried to `moving`
+  const [hoverEdge, setHoverEdge] = useState(false);
+  const [moving, setMoving] = useState<Rect | null>(null);
+  const moveStart = useRef<{ row: number; col: number; from: Rect }>({
+    row: 1,
+    col: 1,
+    from: { row: 1, col: 1, height: 1, width: 1 },
+  });
   useEffect(() => setResize(null), [layout]);
 
   // Prefix sums give O(log n) hit-testing and O(1) cell geometry.
@@ -440,6 +455,20 @@ export function Grid(p: Props) {
       ctx.strokeRect(px + 1, py + 1, pw - 2, ph - 2);
       ctx.setLineDash([]);
     }
+    // where the dragged cells would land
+    if (moving) {
+      const mx = colScreen(moving.col - 1);
+      const my = rowScreen(moving.row - 1);
+      const mw = colX[Math.min(moving.col - 1 + moving.width, cols)] - colX[moving.col - 1];
+      const mh = rowY[Math.min(moving.row - 1 + moving.height, rows)] - rowY[moving.row - 1];
+      ctx.fillStyle = selFill;
+      ctx.fillRect(mx, my, mw, mh);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 3]);
+      ctx.strokeRect(mx + 1, my + 1, mw - 2, mh - 2);
+      ctx.setLineDash([]);
+    }
     ctx.restore();
 
     // column headers
@@ -507,7 +536,7 @@ export function Grid(p: Props) {
         if (resize) ctx.fillRect(x - 0.5, HEADER_H, 1, h - HEADER_H);
       }
     }
-  }, [size, scroll, vis, colX, rowY, rows, cols, p.sel, p.sheet, resize, hoverBorder, layout.merges, p.refs]);
+  }, [size, scroll, vis, colX, rowY, rows, cols, p.sel, p.sheet, resize, hoverBorder, layout.merges, p.refs, moving]);
 
   useLayoutEffect(() => {
     draw();
@@ -555,6 +584,33 @@ export function Grid(p: Props) {
     return [col];
   };
 
+  /** The selection with the merged cells it touches whole. */
+  const selectedRect = () => expandRect(selRect(p.sel), layout.merges);
+
+  /** On the edge of the selection, where a drag carries the cells away. */
+  const onSelectionEdge = (clientX: number, clientY: number): boolean => {
+    if (p.editing) return false;
+    const r = selectedRect();
+    // whole rows and columns can't be moved this way
+    if ((r.row === 1 && r.height >= rows) || (r.col === 1 && r.width >= cols)) return false;
+    const el = scroller.current!;
+    const box = el.getBoundingClientRect();
+    const px = clientX - box.left;
+    const py = clientY - box.top;
+    if (px < HEADER_W || py < HEADER_H || px >= el.clientWidth || py >= el.clientHeight) return false;
+    const x = px - HEADER_W + el.scrollLeft;
+    const y = py - HEADER_H + el.scrollTop;
+    const left = colX[r.col - 1];
+    const right = colX[Math.min(r.col - 1 + r.width, cols)];
+    const top = rowY[r.row - 1];
+    const bottom = rowY[Math.min(r.row - 1 + r.height, rows)];
+    const near =
+      x >= left - GRAB_OUT && x <= right + GRAB_OUT && y >= top - GRAB_OUT && y <= bottom + GRAB_OUT;
+    const inner =
+      x > left + GRAB_IN && x < right - GRAB_IN && y > top + GRAB_IN && y < bottom - GRAB_IN;
+    return near && !inner;
+  };
+
   const onMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
     const el = scroller.current!;
@@ -575,6 +631,15 @@ export function Grid(p: Props) {
       }
     }
     el.focus();
+    if (!e.shiftKey && onSelectionEdge(e.clientX, e.clientY)) {
+      const h = hit(e.clientX, e.clientY);
+      const from = selectedRect();
+      dragging.current = "move";
+      moveStart.current = { row: h.row, col: h.col, from };
+      setMoving(from);
+      setHoverEdge(false);
+      return;
+    }
     if (p.editing) p.commitEdit(0, 0);
     if (border !== null) {
       const width = colX[border] - colX[border - 1];
@@ -612,8 +677,44 @@ export function Grid(p: Props) {
     }
   };
 
+  const onContextMenu = (e: React.MouseEvent) => {
+    // the cell editor keeps the browser's own Cut / Copy / Paste menu
+    if ((e.target as HTMLElement).tagName === "INPUT") return;
+    e.preventDefault();
+    const el = scroller.current!;
+    const box = el.getBoundingClientRect();
+    // not on the scrollbars
+    if (e.clientX - box.left >= el.clientWidth || e.clientY - box.top >= el.clientHeight) return;
+    // a ctrl-click on a Mac starts a drag that never sees its mouse-up
+    dragging.current = null;
+    // while a formula is being pointed at, the click is not for us
+    if (p.editing && p.canPoint()) return;
+    const h = hit(e.clientX, e.clientY);
+    if (h.onColHeader && h.onRowHeader) return;
+    el.focus();
+    if (p.editing) p.commitEdit(0, 0);
+    // like Sheets, a right-click inside the selection keeps it and one outside moves it
+    const r = expandRect(selRect(p.sel), layout.merges);
+    const inCols = h.col >= r.col && h.col < r.col + r.width;
+    const inRows = h.row >= r.row && h.row < r.row + r.height;
+    if (h.onColHeader) {
+      if (!(inCols && r.row === 1 && r.height === rows)) {
+        p.setSel({ ar: 1, ac: h.col, fr: rows, fc: h.col });
+      }
+    } else if (h.onRowHeader) {
+      if (!(inRows && r.col === 1 && r.width === cols)) {
+        p.setSel({ ar: h.row, ac: 1, fr: h.row, fc: cols });
+      }
+    } else if (!(inCols && inRows)) {
+      p.setSel({ ar: h.row, ac: h.col, fr: h.row, fc: h.col });
+    }
+    p.onContextMenu({ left: e.clientX, top: e.clientY });
+  };
+
   const resizeRef = useRef(resize);
   resizeRef.current = resize;
+  const movingRef = useRef(moving);
+  movingRef.current = moving;
   const selRef = useRef(p.sel);
   selRef.current = p.sel;
   useEffect(() => {
@@ -629,6 +730,16 @@ export function Grid(p: Props) {
         return;
       }
       const h = hit(e.clientX, e.clientY);
+      if (mode === "move") {
+        const { row, col, from } = moveStart.current;
+        // the cells keep their shape and stay on the sheet
+        setMoving({
+          ...from,
+          row: Math.min(Math.max(1, from.row + h.row - row), rows - from.height + 1),
+          col: Math.min(Math.max(1, from.col + h.col - col), cols - from.width + 1),
+        });
+        return;
+      }
       if (mode === "point") {
         const a = pointAnchor.current;
         p.onPoint({
@@ -645,6 +756,12 @@ export function Grid(p: Props) {
       else p.setSel({ ...s, fr: h.row, fc: cols });
     };
     const up = () => {
+      if (dragging.current === "move") {
+        const { from } = moveStart.current;
+        const to = movingRef.current;
+        setMoving(null);
+        if (to && (to.row !== from.row || to.col !== from.col)) p.onMoveCells(from, to.row, to.col);
+      }
       if (dragging.current === "resize") {
         const start = resizeStart.current;
         const width = resizeRef.current?.width ?? start.width;
@@ -653,11 +770,20 @@ export function Grid(p: Props) {
       }
       dragging.current = null;
     };
+    // Escape drops the cells where they were
+    const cancel = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && dragging.current === "move") {
+        dragging.current = null;
+        setMoving(null);
+      }
+    };
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
+    window.addEventListener("keydown", cancel);
     return () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
+      window.removeEventListener("keydown", cancel);
     };
   });
 
@@ -709,7 +835,7 @@ export function Grid(p: Props) {
   return (
     <div
       ref={scroller}
-      className={`grid-scroller ${hoverBorder !== null || resize ? "col-resize" : ""}`}
+      className={`grid-scroller ${hoverBorder !== null || resize ? "col-resize" : ""} ${moving ? "moving" : hoverEdge ? "can-move" : ""}`}
       tabIndex={0}
       data-grid="true"
       onScroll={(e) => {
@@ -717,12 +843,20 @@ export function Grid(p: Props) {
         setScroll({ x: t.scrollLeft, y: t.scrollTop });
       }}
       onMouseDown={onMouseDown}
+      onContextMenu={onContextMenu}
       onMouseMove={(e) => {
+        if (!dragging.current) {
+          const edge = onSelectionEdge(e.clientX, e.clientY);
+          if (edge !== hoverEdge) setHoverEdge(edge);
+        }
         if (dragging.current && dragging.current !== "resize") return;
         const border = dragging.current ? resizeStart.current.col : borderAt(e.clientX, e.clientY);
         if (border !== hoverBorder) setHoverBorder(border);
       }}
-      onMouseLeave={() => !dragging.current && setHoverBorder(null)}
+      onMouseLeave={() => {
+        setHoverEdge(false);
+        if (!dragging.current) setHoverBorder(null);
+      }}
       onDoubleClick={onDoubleClick}
       onKeyDown={p.onKeyDown}
     >
