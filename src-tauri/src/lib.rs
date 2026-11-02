@@ -245,8 +245,21 @@ fn load_csv(path: &Path) -> CmdResult<UserModel<'static>> {
 }
 
 fn load_xlsx(path: &Path) -> CmdResult<UserModel<'static>> {
-    let m: Model<'static> = load_from_xlsx(&path.to_string_lossy(), LOCALE, TZ, LANG)
-        .map_err(|e| e.to_string())?;
+    // IronCalc's importer can panic on unusual workbooks (e.g. an out-of-range
+    // index in styles.xml). Inside a webview callback that panic can't unwind and
+    // aborts the whole app, so turn it into an ordinary error instead.
+    let p = path.to_string_lossy();
+    let m: Model<'static> =
+        std::panic::catch_unwind(|| load_from_xlsx(&p, LOCALE, TZ, LANG))
+            .map_err(|panic| {
+                let why = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown error");
+                format!("Couldn't read this workbook ({why})")
+            })?
+            .map_err(|e| e.to_string())?;
     Ok(UserModel::from_model(m))
 }
 
