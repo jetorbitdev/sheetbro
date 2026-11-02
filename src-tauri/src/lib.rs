@@ -1679,6 +1679,9 @@ fn focus_window_with(app: &AppHandle, path: &str) -> bool {
     true
 }
 
+/// Set once the app has finished launching and the main window from the config exists.
+static READY: AtomicBool = AtomicBool::new(false);
+
 /// Shows `path` from Finder in the window that already has it open, else in an untouched
 /// window, else in a new window.
 fn route_open(app: &AppHandle, path: String) -> CmdResult<()> {
@@ -1688,6 +1691,11 @@ fn route_open(app: &AppHandle, path: String) -> CmdResult<()> {
     let state = app.state::<AppState>();
     let active = state.active_label();
     let mut labels: Vec<String> = app.webview_windows().into_keys().collect();
+    // Launching the app by opening a file delivers the file before the main window is
+    // made. Hand it to that window, or it would open behind it in a second one.
+    if !READY.load(Ordering::SeqCst) && !labels.iter().any(|l| l == "main") {
+        labels.push("main".into());
+    }
     // the window in front first
     labels.sort_by_key(|l| *l != active);
     if let Some(label) = labels.into_iter().find(|l| state.is_untouched(l)) {
@@ -1925,6 +1933,9 @@ pub fn run() {
                 api.prevent_exit();
                 return;
             }
+        }
+        if let tauri::RunEvent::Ready = event {
+            READY.store(true, Ordering::SeqCst);
         }
         #[cfg(target_os = "macos")]
         match event {
