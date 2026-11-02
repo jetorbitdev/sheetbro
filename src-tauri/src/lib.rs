@@ -24,7 +24,7 @@ use ironcalc::{
         ClipboardData, Model, UserModel,
     },
     export::save_xlsx_to_writer,
-    import::load_from_xlsx,
+    import::{load_from_xlsx, load_from_xlsx_bytes},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -245,22 +245,100 @@ fn load_csv(path: &Path) -> CmdResult<UserModel<'static>> {
 }
 
 fn load_xlsx(path: &Path) -> CmdResult<UserModel<'static>> {
-    // IronCalc's importer can panic on unusual workbooks (e.g. an out-of-range
-    // index in styles.xml). Inside a webview callback that panic can't unwind and
-    // aborts the whole app, so turn it into an ordinary error instead.
-    let p = path.to_string_lossy();
-    let m: Model<'static> =
-        std::panic::catch_unwind(|| load_from_xlsx(&p, LOCALE, TZ, LANG))
-            .map_err(|panic| {
-                let why = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown error");
-                format!("Couldn't read this workbook ({why})")
-            })?
-            .map_err(|e| e.to_string())?;
+    // IronCalc's importer can panic on unusual workbooks. Inside a webview callback that
+    // panic can't unwind and aborts the whole app, so turn it into an ordinary error instead.
+    let m: Model<'static> = std::panic::catch_unwind(|| match with_complete_styles(path) {
+        None => load_from_xlsx(&path.to_string_lossy(), LOCALE, TZ, LANG)
+            .map_err(|e| e.to_string()),
+        Some(bytes) => {
+            let workbook = load_from_xlsx_bytes(&bytes, &file_stem(path), LOCALE, TZ)
+                .map_err(|e| e.to_string())?;
+            Model::from_workbook(workbook, LANG)
+        }
+    })
+    .map_err(|panic| {
+        let why = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown error");
+        format!("Couldn't read this workbook ({why})")
+    })??;
     Ok(UserModel::from_model(m))
+}
+
+/// Parts of styles.xml that IronCalc expects to be there (it panics when one is missing),
+/// with the defaults Excel writes. The file format makes all of them optional, and some
+/// apps and libraries leave them out.
+const STYLE_PARTS: [(&str, &str); 6] = [
+    ("fonts", r#"<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>"#),
+    (
+        "fills",
+        r#"<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>"#,
+    ),
+    ("borders", r#"<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>"#),
+    ("cellStyleXfs", r#"<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>"#),
+    ("cellXfs", r#"<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>"#),
+    ("cellStyles", r#"<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#),
+];
+
+/// styles.xml with the parts IronCalc needs added, or `None` when nothing is missing or
+/// the file can't be understood well enough to fix.
+fn complete_styles(xml: &str) -> Option<String> {
+    // the root may carry a namespace prefix (`<x:styleSheet>`); the added parts get it too
+    let name_at = xml.find("styleSheet")?;
+    let lt = xml[..name_at].rfind('<')?;
+    let prefix = &xml[lt + 1..name_at];
+    if !(prefix.is_empty() || prefix.ends_with(':')) {
+        return None;
+    }
+    let has = |tag: &str| {
+        let open = format!("<{prefix}{tag}");
+        xml.match_indices(&open).any(|(i, _)| {
+            matches!(xml.as_bytes().get(i + open.len()), Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/'))
+        })
+    };
+    let added: String = STYLE_PARTS
+        .iter()
+        .filter(|(tag, _)| !has(tag))
+        .map(|(_, part)| if prefix.is_empty() { part.to_string() } else { part.replace('<', &format!("<{prefix}")).replace(&format!("<{prefix}/"), &format!("</{prefix}")) })
+        .collect();
+    if added.is_empty() {
+        return None;
+    }
+    let close = format!("</{prefix}styleSheet>");
+    if let Some(at) = xml.rfind(&close) {
+        return Some(format!("{}{added}{}", &xml[..at], &xml[at..]));
+    }
+    // an empty, self-closing root
+    let end = name_at + xml[name_at..].find('>')?;
+    (xml.as_bytes()[end - 1] == b'/').then(|| format!("{}>{added}{close}", &xml[..end - 1]))
+}
+
+/// The bytes of the workbook at `path` with its styles completed, or `None` when it can be
+/// loaded as it is.
+fn with_complete_styles(path: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut archive = zip::ZipArchive::new(fs::File::open(path).ok()?).ok()?;
+    let xml = match archive.by_name("xl/styles.xml") {
+        Ok(mut file) => {
+            let mut xml = String::new();
+            file.read_to_string(&mut xml).ok()?;
+            xml
+        }
+        Err(_) => r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#.into(),
+    };
+    let fixed = complete_styles(&xml)?;
+    let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for i in 0..archive.len() {
+        let file = archive.by_index_raw(i).ok()?;
+        if file.name().ok()? != "xl/styles.xml" {
+            out.raw_copy_file(file).ok()?;
+        }
+    }
+    out.start_file("xl/styles.xml", zip::write::SimpleFileOptions::default()).ok()?;
+    out.write_all(fixed.as_bytes()).ok()?;
+    Some(out.finish().ok()?.into_inner())
 }
 
 fn csv_escape(s: &str, delim: char) -> String {
@@ -1967,6 +2045,70 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spritsit-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    #[test]
+    fn complete_styles_adds_only_missing_parts() {
+        let full: String = STYLE_PARTS.iter().map(|(_, p)| *p).collect();
+        assert_eq!(complete_styles(&format!("<styleSheet>{full}</styleSheet>")), None);
+
+        let fixed = complete_styles(r#"<?xml version="1.0"?><styleSheet xmlns="m"><fonts count="0"/></styleSheet>"#).unwrap();
+        assert_eq!(fixed.matches("<fonts").count(), 1);
+        for tag in ["<fills", "<borders", "<cellStyleXfs", "<cellXfs", "<cellStyles "] {
+            assert!(fixed.contains(tag), "{tag} missing in {fixed}");
+        }
+        assert!(fixed.ends_with("</cellStyles></styleSheet>"));
+
+        // a prefixed root gets prefixed parts; an empty root is opened up
+        let fixed = complete_styles(r#"<x:styleSheet xmlns:x="m"/>"#).unwrap();
+        assert!(fixed.starts_with(r#"<x:styleSheet xmlns:x="m"><x:fonts count="1"><x:font><x:sz val="11"/>"#));
+        assert!(fixed.ends_with("</x:cellStyles></x:styleSheet>"));
+        assert!(!fixed.contains("</fonts") && !fixed.contains("<cellXfs"));
+    }
+
+    #[test]
+    fn opens_xlsx_with_missing_style_parts() {
+        use std::io::{Read, Write};
+        let model = load_csv(&{
+            let csv = tmp("styles.csv");
+            fs::write(&csv, "a,b\n1,=A2*2\n").unwrap();
+            csv
+        })
+        .unwrap();
+        let good = tmp("styles-good.xlsx");
+        save_xlsx(&model, &good).unwrap();
+
+        // rewrite styles.xml without <cellStyleXfs> and <cellStyles>, like some generators do
+        let mut archive = zip::ZipArchive::new(fs::File::open(&good).unwrap()).unwrap();
+        let bad = tmp("styles-bad.xlsx");
+        let mut out = zip::ZipWriter::new(fs::File::create(&bad).unwrap());
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).unwrap();
+            let name = file.name().unwrap().to_string();
+            let mut data = String::new();
+            file.read_to_string(&mut data).unwrap();
+            if name == "xl/styles.xml" {
+                for tag in ["cellStyleXfs", "cellStyles"] {
+                    let start = data.find(&format!("<{tag}")).unwrap();
+                    let end = data.find(&format!("</{tag}>")).unwrap() + tag.len() + 3;
+                    data.replace_range(start..end, "");
+                }
+            }
+            out.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            out.write_all(data.as_bytes()).unwrap();
+        }
+        out.finish().unwrap();
+
+        // IronCalc on its own panics on this file
+        let raw = std::panic::catch_unwind(|| load_from_xlsx(&bad.to_string_lossy(), LOCALE, TZ, LANG).map(|_| ()));
+        assert!(raw.is_err());
+
+        let back = load_xlsx(&bad).unwrap();
+        assert_eq!(back.get_formatted_cell_value(0, 2, 2).unwrap(), "2");
+        assert_eq!(back.get_cell_content(0, 2, 2).unwrap(), "=A2*2");
+        assert_eq!(back.get_model().workbook.name, "styles-bad");
+        // a complete file still goes the usual way
+        assert!(with_complete_styles(&good).is_none());
     }
 
     #[test]

@@ -3331,6 +3331,7 @@ dependencies = [
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
  "tiny_http",
+ "zip",
 ]
 
 [[package]]
