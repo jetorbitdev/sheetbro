@@ -339,6 +339,16 @@ as the tag, the title as the release name, and paste the bullet list as the rele
 Keep one change per line and start it with `feat:`, `fix:`, `perf:` or `docs:`, so the website
 can label it New, Fix, Perf or Docs.
 
+### v0.4.0 — OpenAI agents and sturdier file opening
+
+_November 8, 2026_
+
+- feat: The AI tools panel has an OpenAI Agents SDK tab with a ready-to-run Python script that connects an agent to the open workbook
+- fix: Open xlsx files whose styles.xml leaves out optional parts
+- fix: A file opened from Finder shows up when it launches the app
+- fix: Report unreadable xlsx files instead of crashing
+- docs: Connecting the OpenAI Agents SDK, and why ChatGPT connectors can't reach the local server
+
 ### v0.3.0 — Faster, fuller AI tools
 
 _October 29, 2026_
