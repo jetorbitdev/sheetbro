@@ -47,7 +47,7 @@ The Windows installers aren't code-signed yet, so SmartScreen shows a warning. C
 
 1. Open the **AI tools** panel in SheetBro and turn on **Allow AI tools to connect**.
 2. Pick your client. SheetBro shows a ready-made config snippet for Claude Code, Claude Desktop,
-   Cursor, VS Code, Windsurf, Gemini CLI and Codex CLI.
+   Cursor, VS Code, Windsurf, Gemini CLI, Codex CLI and the OpenAI Agents SDK.
 3. Copy the snippet into your client's MCP settings.
 
 ![The AI tools panel with the MCP server turned on and the Claude Code setup command shown](docs/mcp-panel.png)
@@ -56,7 +56,7 @@ There are two ways to connect:
 
 | Transport | Used by | How it works |
 |---|---|---|
-| Streamable HTTP | Claude Code, Cursor, VS Code, Windsurf, Gemini CLI | `POST http://127.0.0.1:7424/mcp` with an `Authorization: Bearer <token>` header |
+| Streamable HTTP | Claude Code, Cursor, VS Code, Windsurf, Gemini CLI, OpenAI Agents SDK | `POST http://127.0.0.1:7424/mcp` with an `Authorization: Bearer <token>` header |
 | stdio | Claude Desktop, Codex CLI | The client launches the SheetBro binary with `--mcp-stdio`, which relays messages to the running app |
 
 For example, with Claude Code:
@@ -65,6 +65,25 @@ For example, with Claude Code:
 claude mcp add --transport http sheetbro http://127.0.0.1:7424/mcp \
   --header "Authorization: Bearer <token>"
 ```
+
+To build your own agent on OpenAI models, use the
+[OpenAI Agents SDK](https://openai.github.io/openai-agents-python/mcp/) (`pip install openai-agents`)
+and connect it over Streamable HTTP:
+
+```python
+from agents import Agent, Runner
+from agents.mcp import MCPServerStreamableHttp
+
+async with MCPServerStreamableHttp(
+    name="sheetbro",
+    params={"url": "http://127.0.0.1:7424/mcp", "headers": {"Authorization": "Bearer <token>"}},
+) as sheetbro:
+    agent = Agent(name="Spreadsheet assistant", mcp_servers=[sheetbro])
+    result = await Runner.run(agent, "Summarize what is in the open sheet.")
+```
+
+The server only listens on this computer, so ChatGPT connectors and the hosted `mcp` tool in the
+OpenAI Responses API, which call MCP servers from OpenAI's side, can't reach it.
 
 ### Available tools
 

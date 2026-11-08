@@ -63,6 +63,36 @@ const CLIENTS: Client[] = [
       `[mcp_servers.sheetbro]\ncommand = ${JSON.stringify(s.command)}\nargs = ["--mcp-stdio"]`,
   },
   {
+    id: "openai-agents",
+    name: "OpenAI Agents SDK",
+    where: "Run pip install openai-agents and set OPENAI_API_KEY, then run this Python script:",
+    snippet: (s) =>
+      [
+        "import asyncio",
+        "",
+        "from agents import Agent, Runner",
+        "from agents.mcp import MCPServerStreamableHttp",
+        "",
+        "",
+        "async def main():",
+        "    async with MCPServerStreamableHttp(",
+        '        name="sheetbro",',
+        `        params={"url": ${JSON.stringify(s.url)}, "headers": ${JSON.stringify(bearer(s))}},`,
+        "        cache_tools_list=True,",
+        "    ) as sheetbro:",
+        "        agent = Agent(",
+        '            name="Spreadsheet assistant",',
+        '            instructions="Use the SheetBro tools to read and edit the open workbook.",',
+        "            mcp_servers=[sheetbro],",
+        "        )",
+        '        result = await Runner.run(agent, "Summarize what is in the open sheet.")',
+        "        print(result.final_output)",
+        "",
+        "",
+        "asyncio.run(main())",
+      ].join("\n"),
+  },
+  {
     id: "other",
     name: "Other",
     where: "Any MCP client: use the HTTP details, or the command if it only runs local servers.",
@@ -223,7 +253,7 @@ export function McpPanel({ status, onChange, onError, onClose }: Props) {
         ) : (
           <p className="mcp-note">
             Turn it on to get ready-made settings for Claude Code, Claude Desktop, Cursor, VS Code,
-            Windsurf, Gemini CLI and Codex.
+            Windsurf, Gemini CLI, Codex and the OpenAI Agents SDK.
           </p>
         )}
 
