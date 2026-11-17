@@ -45,6 +45,7 @@ import { anchorOf, expandRect } from "./merges";
 import { ContextMenu, MenuEntry, MenuItem } from "./ContextMenu";
 import { FunctionMenu } from "./FunctionMenu";
 import { McpPanel } from "./McpPanel";
+import { AskAiPanel } from "./AskAiPanel";
 import { FormulaMirror } from "./FormulaMirror";
 import { docFor, expectsReference, formulaRefs, functionContext, normalizeFormula, parseSyntax } from "./formula";
 import { adjustDecimals, parseTsv, toTsv } from "./tsv";
@@ -83,6 +84,7 @@ export function App() {
   const [fnMenu, setFnMenu] = useState<{ left: number; top: number } | null>(null);
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [askAiOpen, setAskAiOpen] = useState(false);
   // last cell reference inserted by clicking (or arrowing) while typing a formula,
   // with the cells it covers so the arrow keys can carry on from there
   const pointRefRef = useRef<{ start: number; end: number; cursor: Sel } | null>(null);
@@ -982,6 +984,7 @@ export function App() {
           <span>MCP</span>
           {mcp?.running && <i className="mcp-dot" />}
         </button>
+        <button className={`tb ${askAiOpen ? "on" : ""}`} aria-expanded={askAiOpen} onClick={() => setAskAiOpen(v => !v)}>Ask AI</button>
       </div>
       {ctxMenu && <ContextMenu at={ctxMenu} items={contextMenuItems(ctxMenu.ownClip)} onClose={closeCtxMenu} />}
       {fnMenu && <FunctionMenu anchor={fnMenu} onPick={pickFunction} onClose={() => setFnMenu(null)} />}
@@ -1054,6 +1057,7 @@ export function App() {
         })()}
       </div>
 
+      <div className="ask-ai-workspace">
       <main className="grid-wrap">
         <Grid
           sheet={sheet}
@@ -1091,6 +1095,16 @@ export function App() {
         {dropping && <div className="drop-overlay">Drop to open</div>}
         {toast && <div className="toast">{toast}</div>}
       </main>
+      {askAiOpen && <AskAiPanel
+        key={docId}
+        selection={`${info?.sheets[sheet]?.name ?? "Sheet"}!${rangeLabel}`}
+        readSelection={async () => {
+          if (rect.width * rect.height > 200) throw new Error("Selection too large");
+          return api.getRangeText(sheet, rect, true);
+        }}
+        onClose={() => { setAskAiOpen(false); focusGrid(); }}
+      />}
+      </div>
 
       <footer className="statusbar">
         <div className="tabs">
